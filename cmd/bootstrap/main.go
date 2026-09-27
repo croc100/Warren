@@ -64,8 +64,10 @@ func runGenKey() {
 	if err != nil {
 		log.Fatalf("bootstrap: %v", err)
 	}
-	fmt.Printf("WARREN_BRIDGE_KEY_HEX=%s\n", hex.EncodeToString(priv))
-	fmt.Printf("WARREN_BRIDGE_ANCHOR_HEX=%s\n", hex.EncodeToString(pub))
+	// Shell exports, so `eval "$(bootstrap -genkey)"` puts both where the signing
+	// and verifying commands can actually see them.
+	fmt.Printf("export WARREN_BRIDGE_KEY_HEX=%s\n", hex.EncodeToString(priv))
+	fmt.Printf("export WARREN_BRIDGE_ANCHOR_HEX=%s\n", hex.EncodeToString(pub))
 	fmt.Fprintln(os.Stderr, "\nThe anchor ships with clients; the signing key stays offline. Rotate by")
 	fmt.Fprintln(os.Stderr, "shipping a client that trusts both the old and the new anchor.")
 }

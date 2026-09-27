@@ -37,8 +37,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("node: %v", err)
 		}
-		fmt.Printf("WARREN_RELAY_KEY_HEX=%s\n", hex.EncodeToString(priv))
-		fmt.Printf("relay public key (publish this with the bridge address): %s\n", hex.EncodeToString(pub))
+		// Printed as shell exports so `eval "$(node -genkey)"` sets both in the
+		// caller's environment. Without the export the variables would stay in
+		// the shell and never reach the relay or the client, which is a papercut
+		// worth not shipping.
+		fmt.Printf("export WARREN_RELAY_KEY_HEX=%s\n", hex.EncodeToString(priv))
+		fmt.Printf("export WARREN_RELAY_PUBKEY_HEX=%s\n", hex.EncodeToString(pub))
+		fmt.Fprintln(os.Stderr, "\nThe private half never leaves this relay. The public half goes in the bridge")
+		fmt.Fprintln(os.Stderr, "descriptor, as the third field of addr|sni|pubkey.")
 		return
 	}
 

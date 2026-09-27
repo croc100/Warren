@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+
+      # -race matters more here than usual: the relay runs a goroutine per
+      # connection over shared state (replay cache, the live flight profile), and
+      # the transport's worst bug so far was a timing-dependent one that passed
+      # cleanly without it.
+      - run: go test ./... -race -count=1
+
+  gate:
+    name: L1 gate (end-to-end)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Drives the real binaries through the whole flow and finishes by running
+      # cmd/probe, which exits non-zero if anything separates a relay from the
+      # site it borrows. The unit tests cover the protocol; this covers the wiring
+      # and the verdict.
+      - run: ./hack/smoke.sh

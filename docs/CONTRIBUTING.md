@@ -25,11 +25,13 @@ what it is.
 go test ./... -race
 gofmt -l ./cmd ./internal     # must print nothing
 go vet ./...
+./hack/smoke.sh               # end-to-end, ending in the L1 gate
 ```
 
-If you touched the transport, also run the gate against a real TLS site and paste
-the output. The [README](../README.md#try-it) has a four-terminal setup; the short
-version is that `cmd/probe` must still exit zero.
+CI runs exactly these. `hack/smoke.sh` stands up a real TLS site, a relay and a
+client, walks the whole flow, and finishes with `cmd/probe`, which exits non-zero
+if anything separates the relay from the site it borrows. If you touched the
+transport, paste its output in the PR.
 
 ## Conventions
 

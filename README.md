@@ -127,6 +127,7 @@ Four terminals. There is no installer, no package, and no binary release.
 git clone https://github.com/croc100/warren.git
 cd warren
 go test ./... -race
+./hack/smoke.sh    # or: make smoke — the whole flow below, automated
 ```
 
 **1. A stand-in "real site" for the relay to borrow.** In production this is an
@@ -151,8 +152,8 @@ than Warren's, which would make the first server packet a giveaway.
 go run ./cmd/node -profile-only -profile-insecure \
   -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 
-go run ./cmd/node -genkey            # note both halves
-WARREN_RELAY_KEY_HEX=<private half> go run ./cmd/node -listen=127.0.0.1:8443 \
+eval "$(go run ./cmd/node -genkey)"   # WARREN_RELAY_KEY_HEX + WARREN_RELAY_PUBKEY_HEX
+go run ./cmd/node -listen=127.0.0.1:8443 \
   -profile-insecure -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 ```
 
@@ -160,8 +161,8 @@ WARREN_RELAY_KEY_HEX=<private half> go run ./cmd/node -listen=127.0.0.1:8443 \
 a hostile discovery channel a denial of service rather than a redirection:
 
 ```bash
-eval "$(go run ./cmd/bootstrap -genkey 2>/dev/null)"   # anchor + signing key
-go run ./cmd/bootstrap -sign -bridge="127.0.0.1:8443|www.example.com|<relay public half>" > bridges.txt
+eval "$(go run ./cmd/bootstrap -genkey)"   # anchor + signing key
+go run ./cmd/bootstrap -sign -bridge="127.0.0.1:8443|www.example.com|$WARREN_RELAY_PUBKEY_HEX" > bridges.txt
 go run ./cmd/bootstrap -verify -file=bridges.txt
 
 go run ./cmd/cli -bridge-file=bridges.txt -message="hello from behind the firewall"
@@ -172,7 +173,7 @@ whether anything separates them:
 
 ```bash
 go run ./cmd/probe -relay=127.0.0.1:8443 -site=127.0.0.1:9443 \
-  -sni=www.example.com -relay-key=<relay public half>
+  -sni=www.example.com -relay-key=$WARREN_RELAY_PUBKEY_HEX
 ```
 
 ```

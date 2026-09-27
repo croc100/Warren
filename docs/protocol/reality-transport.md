@@ -304,8 +304,7 @@ machine finds at the worst moment. Fixed by having the parse take copies.
 
 ```bash
 # 1. generate the relay identity (private half stays here, public half is published)
-eval "$(go run ./cmd/node -genkey | head -1)"   # exports WARREN_RELAY_KEY_HEX
-go run ./cmd/node -genkey                        # prints a pair; note the public key
+eval "$(go run ./cmd/node -genkey)"   # WARREN_RELAY_KEY_HEX + WARREN_RELAY_PUBKEY_HEX
 
 # 2. a stand-in "real site" the relay borrows an identity from
 python3 -m http.server 9443
@@ -317,11 +316,11 @@ go run ./cmd/node -listen=127.0.0.1:8443 -profile-insecure \
   -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 
 # 4. the bridge-distribution trust anchor (signing key stays offline)
-eval "$(go run ./cmd/bootstrap -genkey 2>/dev/null)"
+eval "$(go run ./cmd/bootstrap -genkey)"
 
 # 5. a signed descriptor, as an out-of-band channel would distribute it
 go run ./cmd/bootstrap -sign -ttl=168h \
-  -bridge="127.0.0.1:8443|www.example.com|<relay public key hex>" > bridges.txt
+  -bridge="127.0.0.1:8443|www.example.com|$WARREN_RELAY_PUBKEY_HEX" > bridges.txt
 go run ./cmd/bootstrap -verify -file=bridges.txt
 
 # 6. the client
@@ -340,7 +339,8 @@ is indistinguishable from a web server.
 ## Tests
 
 ```bash
-go test ./internal/network/transport/... ./internal/discovery/bootstrap/... -race
+go test ./... -race
+./hack/smoke.sh    # the flow above, automated, ending in the gate
 ```
 
 Covers: the shaped flight reproducing a profile's record sizes exactly, in order,

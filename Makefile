@@ -1,4 +1,4 @@
-.PHONY: test build gate fmt vet clean
+.PHONY: test build smoke gate fmt vet clean
 
 # Everything that gates a change.
 test:
@@ -16,7 +16,12 @@ build:
 	go build -o bin/bootstrap ./cmd/bootstrap
 	go build -o bin/probe ./cmd/probe
 
-# The L1 gate: probe a relay against the site it borrows from. Needs a running
+# End-to-end: stands up a real TLS site, a relay and a client, then runs the gate.
+# This is what CI runs.
+smoke:
+	./hack/smoke.sh
+
+# The L1 gate on its own: probe a relay against the site it borrows from. Needs a running
 # relay and its public key — see the README's "Try it" section.
 #   make gate RELAY=127.0.0.1:8443 SITE=127.0.0.1:9443 SNI=www.example.com KEY=<hex>
 gate: build
