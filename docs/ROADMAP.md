@@ -68,9 +68,15 @@ no amount of marketplace or analytics matters.
   channels fail closed without a trust anchor; expiry surfaces as *stale
   discovery* rather than *no bridges*, so blocking every channel for a week does
   not strand clients that already hold working addresses
-- ⬜ Complete the borrowed TLS handshake, or migrate to an audited REALITY
-  implementation — upstream REALITY is X25519-only, so adopting it as-is would
-  trade the post-quantum property for the mimicry property
+- ⬜ Active-probe and record-shape harness ([ADR 0001](adr/0001-borrowed-tls-handshake.md), Stage 0) — the gate itself
+- ⬜ Shape-accurate server flight (Stage A): a real TLS 1.3 server sends a 2–6 KB
+  encrypted certificate flight after its ServerHello and Warren sends nothing
+  there, which is detectable from record sizes alone — **the transport is not
+  safe against a live adversary until this lands**
+- ⬜ Relayed real handshake nested inside the hybrid session (Stage B), only if
+  the harness shows Stage A is still separable. The mimicry-versus-post-quantum
+  trade-off was a false choice: the outer borrowed handshake carries shape, the
+  inner hybrid handshake carries confidentiality
 
 **Gate:** an isolated active-probe harness — connect, replay, resume — cannot
 distinguish a Warren relay from the borrowed site, and the client's hello is not

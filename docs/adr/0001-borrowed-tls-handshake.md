@@ -1,0 +1,142 @@
+# ADR 0001 — How to close L1's handshake-mimicry gap
+
+- **Status:** Accepted (2026-09-28)
+- **Scope:** `internal/network/transport`, Slice 1's gate in [`docs/ROADMAP.md`](../ROADMAP.md)
+- **Supersedes:** the note in [`DESIGN.md` §6.1](../../DESIGN.md) that said the choice was
+  "complete the borrowed handshake, or migrate to xray-core's `reality`"
+
+## Context
+
+Warren's relay answers an authenticated client with a real-shaped TLS 1.3
+ServerHello and ChangeCipherSpec, then switches to its own AEAD records typed
+`application_data`. It never sends a certificate flight, because Warren's keys —
+not the borrowed site's certificate — protect the session.
+
+**The gap is passively detectable, and that is worse than previously written
+down.** A real TLS 1.3 server follows its ServerHello and CCS with
+EncryptedExtensions, Certificate, CertificateVerify and Finished, which is
+typically 2–6 KB of `application_data` records, and the client answers with a
+small Finished record before its first request. Warren sends nothing there. A
+classifier does not need to decrypt anything or hold a Warren client to notice
+"TLS 1.3 session whose server flight after CCS is under 200 bytes" — it only
+needs record sizes and directions. That makes the current transport unsafe
+against a live adversary, and it is the highest-priority remaining L1 defect.
+
+The counterweight is what TLS 1.3 *hides*: the certificate flight is encrypted.
+A passive observer cannot read or validate the certificate at all; it can only
+see sizes and timing. An active prober that connects itself is already handled —
+it has no valid tag, so it is spliced to the real site and gets that site's real
+certificate chain. This asymmetry is what makes the decision below cheaper than
+it first looks.
+
+Two candidate answers were on the table.
+
+### Option A — adopt xray-core's `reality` package
+
+REALITY authenticates with an X25519 exchange embedded in the TLS `key_share`
+and, for authenticated clients, relays the *real* site's handshake while
+substituting a certificate the client can verify against the relay's key. It is
+deployed at scale against the GFW, which is evidence no test harness of ours can
+match.
+
+Against it:
+
+- **It is X25519-only.** Adopting it as-is would trade away the hybrid
+  post-quantum confidentiality Warren just built, on traffic whose defining
+  property is that adversaries record it for later. (Whether current xray-core
+  has changed this is listed under Verification below; the decision does not
+  depend on it.)
+- **Dependency weight and coupling.** xray-core is a large module and its
+  `reality` package is entangled with xray's own config and session types.
+  Importing it drags that surface into a project whose threat model includes
+  supply-chain exposure; forking only the package means the "audited upstream"
+  benefit decays as the fork diverges.
+- **Licensing needs care.** xray-core is MPL-2.0 and Warren is AGPL-3.0. That
+  combination is workable, but only with the MPL files kept identifiable and
+  their obligations honoured — not something to discover after vendoring.
+
+### Option B — implement the full borrowed handshake ourselves
+
+Relay the real site's TLS 1.3 handshake and substitute a certificate signed by
+the relay's identity key. This keeps post-quantum confidentiality and every
+other property Warren already has.
+
+Against it: it is exactly the class of work [`DESIGN.md` §3](../../DESIGN.md)
+says not to hand-roll. Certificate substitution inside a relayed handshake is
+deep protocol surgery whose bugs are invisible until an adversary finds them.
+
+## Decision
+
+Neither, yet. The gap is closed in stages, cheapest first, and the harness comes
+before the cryptography.
+
+### Stage 0 — build the active-probe and classifier harness first
+
+Slice 1's gate already requires it, and no version of this decision can be
+evaluated without it. It must measure the thing that actually matters: the
+distribution of record sizes, directions and timings of a Warren session versus
+a real session to the same borrowed site, plus an active prober that connects,
+replays and resumes. A passive signature tool (nDPI-class) is not evidence.
+
+### Stage A — make the server flight shape-accurate
+
+Emit synthetic records where a real TLS 1.3 server's EncryptedExtensions,
+Certificate, CertificateVerify and Finished would be, sized from the borrowed
+site's own observed flight, and have the client emit a Finished-sized record
+before its first payload. This removes the passive distinguisher described
+above, costs one round of padding rather than a protocol rewrite, and keeps the
+hybrid post-quantum handshake untouched.
+
+This is shape, not substance, and the doc must say so: it defeats an adversary
+who measures, which is the adversary that scales, but it does not produce a
+certificate anyone can verify.
+
+### Stage B — conditional: relay the real handshake, nested
+
+Only if the Stage 0 harness shows Stage A is still separable, or if a target
+region deploys TLS-intercepting middleboxes (a censor with its own CA sees a
+real session to a real site survive interception while Warren's would break).
+
+If it happens, the layering resolves the apparent conflict between mimicry and
+post-quantum, which was a false choice:
+
+```
+outer: borrowed TLS 1.3 handshake, relayed from the real site   -> shape and verifiability
+inner: Warren's hybrid X25519 + ML-KEM-768 handshake            -> confidentiality of recorded traffic
+```
+
+The outer layer only has to look right, so it may be X25519-only because that is
+what the real site dictates. The inner layer carries the post-quantum property.
+Recorded traffic stays protected by the inner layer regardless of what the outer
+one negotiated.
+
+And if Stage B is built, upstream REALITY is used as a **reference
+implementation and test oracle** — run our transport and xray's side by side
+against the same harness — rather than as a dependency. `tls-borrow` stays one
+implementation behind the pluggable-transport interface
+([`DESIGN.md` §6.3](../../DESIGN.md)), so a `reality` transport can be added
+later as a peer without disturbing anything above L1.
+
+## Consequences
+
+- The current transport is **explicitly not safe for use against a live
+  adversary** until Stage A lands. This is now stated in the README, DESIGN and
+  protocol notes rather than left as a footnote.
+- Slice 1's gate is unchanged, and Stage 0 is the next implementation task.
+- Post-quantum confidentiality is not traded away at any stage.
+- A censor that runs a Warren client can still tell a relay from the borrowed
+  site, because it holds a valid tag and can see the flight is synthetic. That
+  is accepted: such an adversary can also enumerate bridges through discovery,
+  which is an L2 anti-enumeration problem ([`DESIGN.md` §7.2](../../DESIGN.md)),
+  not something protocol mimicry can fix.
+- Residual risk, recorded: TLS-intercepting middleboxes (a state CA) break a
+  Warren session where they would not break a real one. Stage B is the answer if
+  a target region deploys them.
+
+## Verification before Stage B
+
+1. Current xray-core REALITY's post-quantum status and whether its auth survives
+   a hybrid `key_share`.
+2. MPL-2.0 / AGPL-3.0 obligations for vendoring versus forking.
+3. What the borrowed site's real flight looks like per target site, since Stage A
+   sizes its synthetic records from it.

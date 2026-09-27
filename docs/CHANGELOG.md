@@ -2,6 +2,37 @@
 
 All notable changes to Warren. Newest first.
 
+## 2026-09-28 — ADR 0001: how L1's handshake-mimicry gap gets closed
+
+Decision recorded in [`docs/adr/0001-borrowed-tls-handshake.md`](adr/0001-borrowed-tls-handshake.md).
+
+Writing it up surfaced that the gap is worse than the previous notes said: it is
+**passively** detectable. A real TLS 1.3 server follows its ServerHello with a
+2–6 KB encrypted certificate flight, Warren sends nothing there, and a classifier
+needs only record sizes and directions to notice — no decryption, no Warren
+client. The transport is therefore documented as not safe against a live
+adversary until this is fixed, in the README, DESIGN and protocol notes.
+
+The decision is to close it in stages rather than to pick between the two options
+previously on the table (import xray-core's `reality`, or hand-roll the full
+borrowed handshake):
+
+- **Stage 0** — build the active-probe and record-shape harness first. It is
+  already Slice 1's gate, and no version of this decision is evaluable without it.
+- **Stage A** — emit shape-accurate synthetic records where a real server's
+  certificate flight would be, sized from the borrowed site's own flight. TLS 1.3
+  encrypts that flight, so a passive observer can only measure shape, and an
+  active prober is already spliced to the real site — which is why padding buys
+  most of the defence at a fraction of the cost.
+- **Stage B** — relay the real handshake only if measurement shows Stage A is
+  still separable, or if a target region deploys TLS-intercepting middleboxes.
+
+The mimicry-versus-post-quantum trade-off turned out to be a false choice: nest
+the layers and the outer borrowed handshake carries shape while the inner hybrid
+handshake carries confidentiality, so no stage gives up ML-KEM. xray-core stays a
+reference implementation and test oracle rather than a dependency (size, coupling,
+X25519-only auth, and MPL-2.0/AGPL-3.0 obligations).
+
 ## 2026-09-28 — L0: signed, expiring bridge descriptors
 
 Second Slice 1 item. Bridges no longer travel as bare `addr|sni|pubkey` lines

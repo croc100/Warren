@@ -369,7 +369,13 @@ replaying one recording.
 
 Remaining gaps are documented in `docs/protocol/reality-transport.md`; the
 blocking one is now the state machine after the ServerHello, not the key
-schedule.
+schedule — and it is **passively** detectable, which makes the current transport
+unsafe against a live adversary. A real TLS 1.3 server follows its ServerHello
+with a 2–6 KB encrypted certificate flight; Warren sends nothing there, and a
+classifier needs only record sizes and directions to notice. How that gets
+closed — shape-accurate synthetic flights first, a relayed real handshake only if
+measurement says so, and never by trading away post-quantum confidentiality — is
+[ADR 0001](docs/adr/0001-borrowed-tls-handshake.md).
 
 ### 6.2 Camouflage profiles are perishable (new, blocking)
 
@@ -863,9 +869,11 @@ predecessor's gate is met.
 - [x] Replay cache, so a captured hello can't be used to confirm a relay
 - [x] TLS-record framing for application data (no bespoke length prefix)
 - [x] Signed, expiring bridge descriptors, with staleness as a reported state
-- [ ] Complete borrowed TLS handshake, or migration to an audited REALITY
-      implementation — note upstream REALITY is X25519-only, so adopting it
-      as-is trades the post-quantum property for the mimicry property
+- [ ] Active-probe and record-shape harness (Stage 0 of [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md))
+- [ ] Shape-accurate server flight, so a Warren session's record sizes match a
+      real TLS 1.3 handshake's (Stage A; removes the passive distinguisher)
+- [ ] Relayed real handshake, nested inside the hybrid session — conditional on
+      what the harness measures (Stage B)
 
 **Gate:** an isolated active-probe harness — a probe that connects, replays, and
 resumes against a Warren relay — cannot distinguish it from the borrowed site, and

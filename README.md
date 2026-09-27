@@ -2,6 +2,12 @@
 
 **The network layer for the CRODE no-log line: Crovi, Thump, and Lumra.**
 
+> **Not safe against a live adversary yet.** A real TLS 1.3 server follows its
+> ServerHello with a 2–6 KB encrypted certificate flight; Warren currently sends
+> nothing there, which a classifier can spot from record sizes alone. The plan to
+> close it is [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md). Do not point
+> this at a censored network expecting it to hold.
+>
 > **Status: pre-alpha.** Two layers work today — multi-channel bridge discovery and
 > a camouflaged TLS transport with a hybrid post-quantum session handshake
 > (~1,700 lines of Go). Everything else in this README is design, not shipped code. The honest breakdown is in
@@ -121,6 +127,8 @@ to opt into knowingly ([`DESIGN.md` §7.4](DESIGN.md#74-abuse-containment-and-op
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — slices and their gates
 - [`docs/protocol/reality-transport.md`](docs/protocol/reality-transport.md) — L0/L1
   implementation notes, bugs found, known gaps
+- [`docs/adr/0001-borrowed-tls-handshake.md`](docs/adr/0001-borrowed-tls-handshake.md) —
+  how L1's handshake-mimicry gap gets closed, and why not by importing xray-core
 
 ---
 

@@ -167,18 +167,23 @@ descriptor.
 
 ## Known gaps vs. a hardened production transport
 
-- **No TLS 1.3 state-machine mimicry after the ServerHello.** The relay's
-  second flight is *shaped* like TLS (ServerHello with a real hybrid key_share,
-  ChangeCipherSpec, then records typed `application_data`), but it is not a real
-  TLS handshake: there is no Certificate/Finished, and Warren's own AEAD keys
-  protect the session instead. A censor who holds a valid tag (i.e. already
-  knows a relay's public key and has a client) could observe that the flight
-  never completes a TLS handshake. Full REALITY avoids this because its
-  non-Warren path *is* a real handshake all the way through. Migrating the
-  authentication path to xray-core's audited `reality` package — or extending
-  this one to complete a borrowed handshake — is the remaining decision;
-  note that upstream REALITY is X25519-only today, so adopting it as-is would
-  trade the post-quantum property for the mimicry property.
+- **No certificate flight after the ServerHello — and it is passively
+  detectable.** A real TLS 1.3 server follows its ServerHello and
+  ChangeCipherSpec with EncryptedExtensions, Certificate, CertificateVerify and
+  Finished: typically 2–6 KB of `application_data` records, answered by a small
+  client Finished. Warren sends nothing there. A classifier needs no decryption
+  and no Warren client to notice "TLS 1.3 session whose server flight after CCS
+  is under 200 bytes"; record sizes and directions are enough. **This is the
+  highest-priority remaining defect, and until it is fixed the transport is not
+  safe against a live adversary.**
+
+  What works in our favour is that TLS 1.3 *encrypts* the certificate flight, so
+  a passive observer can never validate a certificate — only measure the shape —
+  and an active prober is already spliced to the real site and gets that site's
+  genuine chain. So the fix is staged: shape-accurate synthetic records first, a
+  relayed real handshake only if measurement says that is not enough, and never
+  at the cost of the post-quantum property. See
+  [ADR 0001](../adr/0001-borrowed-tls-handshake.md).
 - **Traffic shape is unmodified.** DESIGN.md's `bucket`/`cover` regimes
   (§6.4) aren't implemented; record sizes track payload sizes, so a flow
   classifier still sees Warren's own size and timing distribution.
