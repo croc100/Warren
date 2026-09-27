@@ -1,979 +1,917 @@
 # Warren Technical Architecture & Design
 
-> **Revision note (this update):** Reframes the censorship-evasion strategy around
-> **node-scale diversity** (the ISP Marketplace's pool of ordinary residential nodes)
-> as the primary anti-blocklisting defense, replaces naive SNI-spoofing with a
-> REALITY-style TLS borrowing scheme for Module 2, and splits Module 3 into a
-> local-only authentication proof (no on-chain trace) and a separate opt-in
-> aggregate logging path (kept to preserve the Independence Logger revenue model).
-> Rationale for each change is documented inline.
+> **Revision note (2026-09):** This revision re-bases the design on the 2026
+> censorship, cryptography, and regulatory environment, and on the honest state of
+> the repository (see [§0](#0-implementation-status)). The substantive changes:
+>
+> 1. **Post-quantum TLS is now the baseline**, which changes L1 camouflage from
+>    "look like a browser" to "look like a *current* browser, including its hybrid
+>    ML-KEM key share" — a 2023-era ClientHello is now itself a fingerprint.
+> 2. **Application whitelisting and full shutdowns are no longer forward-looking
+>    risks**; they are deployed. The design adds an explicit degradation ladder
+>    instead of assuming "generic HTTPS" always suffices.
+> 3. **Transport is re-specified as pluggable**, with QUIC/MASQUE (RFC 9298/9484)
+>    as a first-class path rather than a custom framing over TCP only.
+> 4. **The on-chain per-event Independence Logger is retired** and replaced with
+>    private aggregate telemetry (Prio/STAR-class), which preserves the analytics
+>    revenue line while removing an unnecessary privacy liability and a dead
+>    dependency (libsnark).
+> 5. **Settlement moves off L1 mainnet and out of the critical path.** The core
+>    protocol works with no token at all; value transfer is an optional adapter.
+> 6. **Abuse containment and operator liability are now first-class**, because
+>    "residential nodes relay strangers' traffic" is the same shape as the
+>    residential-proxy abuse problem that drew law-enforcement action in 2024–2025.
+> 7. **Satellite/mesh is re-specified as a link type**, not an API integration.
+>    The old failover pseudocode assumed a Starlink tunnel API that does not exist
+>    and a LoRa control-plane capacity ~1–2 orders of magnitude too optimistic.
+>
+> Superseded decisions and the reason each was dropped are listed in
+> [§14](#14-deprecated-decisions).
 
 ## Table of Contents
 
-1. [Core Protocol](#core-protocol)
-2. [Anti-Blocklisting Defense Model](#anti-blocklisting-defense-model)
-3. [Module Specifications](#module-specifications)
-4. [Integration Layer](#integration-layer)
-5. [Data Flow](#data-flow)
-6. [Security Model](#security-model)
-7. [Implementation Roadmap](#implementation-roadmap)
+0. [Implementation Status](#0-implementation-status)
+1. [Threat Environment (2026)](#1-threat-environment-2026)
+2. [Scope & Non-Goals](#2-scope--non-goals)
+3. [Design Principles](#3-design-principles)
+4. [Layered Architecture](#4-layered-architecture)
+5. [L0 — Discovery & Client Distribution](#5-l0--discovery--client-distribution)
+6. [L1 — Transport & Camouflage](#6-l1--transport--camouflage)
+7. [L2 — Relay Pool, Routing & Abuse Containment](#7-l2--relay-pool-routing--abuse-containment)
+8. [L3 — Accounting & Settlement](#8-l3--accounting--settlement)
+9. [L4 — Private Measurement](#9-l4--private-measurement)
+10. [Resilience Transports (Satellite / Mesh)](#10-resilience-transports-satellite--mesh)
+11. [Cryptographic Inventory](#11-cryptographic-inventory)
+12. [Integration Layer (Crovi / Thump)](#12-integration-layer-crovi--thump)
+13. [Security Model](#13-security-model)
+14. [Deprecated Decisions](#14-deprecated-decisions)
+15. [Open Problems](#15-open-problems)
+16. [Roadmap](#16-roadmap)
 
 ---
 
-## Core Protocol
+## 0. Implementation Status
 
-### Warren Protocol Fundamentals
+This document describes a design, not a shipped system. As of this revision the
+repository contains roughly 1,100 lines of Go, and exactly two things work:
 
-Warren is built on a **multi-layered P2P routing protocol** that sits between Layer 3 (IP) and Layer 4 (Transport):
+| Layer | Component | Status |
+|-------|-----------|--------|
+| L0 | `internal/discovery/bootstrap` — multi-channel bridge resolution (DNS TXT / file / static), partial-failure tolerant | **Implemented + tested** |
+| L1 | `internal/network/transport` — "REALITY-lite" tagged ClientHello with real-site fallback splice, AEAD framing | **Implemented + tested (PoC, known gaps)** |
+| L2 | Relay pool, routing, reputation | Not started |
+| L3 | Payment channels, contracts | Solidity sketches only, never compiled or deployed |
+| L4 | Measurement / analytics | Not started |
+| — | Satellite, LoRa, Crovi/Thump integration | Not started |
 
-```
-Application Layer (VPN, DNS, Email)
-          ↓
-Warren Control Plane (Mesh Discovery, Resource Market, Blockchain)
-          ↓
-Warren Data Plane (Encrypted tunnels, Smart routing)
-          ↓
-IP Layer (Actual internet routing)
-```
+Everything else in this document is specification. Where a section describes
+something unbuilt, it says so. Treating the rest of this file as a description of
+existing capability would be a misrepresentation — the directory tree is mostly
+`.gitkeep` files.
 
-### Key Properties
+Two consequences for how to read the roadmap in [§16](#16-roadmap):
 
-| Property | Implementation |
-|----------|----------------|
-| **Discovery** | DHT (Distributed Hash Table) + mDNS for local mesh |
-| **Routing** | Adaptive pathing (Dijkstra variant, latency-optimized) |
-| **Encryption** | ChaCha20-Poly1305 (default), AES-GCM option |
-| **NAT Traversal** | STUN + ICE + UPnP fallback |
-| **Incentive** | Tokens (ERC-20 on Ethereum, or native Solana) |
-| **Consensus** | Blockchain (Ethereum or Solana) for market settlement |
-| **Micro-payments** | **Off-chain Payment Channels**, settled on a hybrid trigger: every 10MB transferred **or** every 5 seconds elapsed, whichever comes first (eliminates gas fee overhead without under-specifying the settlement cadence) |
-| **Protocol Camouflage** | REALITY-style TLS session borrowing (see [Module 2](#module-2-privacy-gateway-dpn)) — replaces naive SNI spoofing |
-| **Node Discovery** | Multi-channel bootstrap (DHT + out-of-band bridge distribution) — no single broker that can become the first block target |
-
-### Node Types
-
-1. **Routing Node** (runs all the time)
-   - Stores DHT entries
-   - Relays traffic
-   - Announces available capacity
-
-2. **Marketplace Node** (sells bandwidth)
-   - Advertising node + routing
-   - Tracks bandwidth utilization
-   - Publishes pricing
-   - **Doubles as a camouflage relay** — ordinary residential IP, short-lived, part of the anti-blocklisting node pool (see next section)
-
-3. **Privacy Node** (runs policy engine)
-   - Encryption/decryption
-   - Policy decision-making
-   - Never stores plaintext user data
-   - Performs REALITY handshake borrowing on behalf of connecting clients
-
-4. **Logger Node** (records independence proofs)
-   - ZKP verification (both local-passport and aggregate-evasion proofs)
-   - Blockchain interaction (aggregate proofs only — see [Module 3](#module-3-independence-verification--logger))
-   - Analytics aggregation
-
-5. **Satellite Node** (failover gateway)
-   - Starlink/Kuiper uplink
-   - LoRa mesh coordinator
-   - Automatic routing failover
+- The repository is close enough to a blank canvas that **no design decision here
+  is load-bearing for legacy compatibility.** Choices are made on technical merit
+  in the 2026 environment, not to preserve earlier drafts.
+- The original month-numbered plan ("Months 1–3", "Months 4–6") is replaced with
+  **falsifiable gates**. A calendar has no opinion about whether a censorship
+  transport survives a probe; a test harness does.
 
 ---
 
-## Anti-Blocklisting Defense Model
+## 1. Threat Environment (2026)
 
-### Why protocol camouflage alone is not enough
+The original design targeted a censor that does signature-based DPI and IP
+blocklisting. That censor still exists, but it is no longer the hard case. Five
+shifts matter for Warren's design:
 
-State-level censors (China's GFW and similar systems) do not primarily rely on decoding
-protocols — they block by **IP/ASN reputation** and by **active probing** (connecting back
-to a suspected server to check whether it behaves like the site it claims to be). This is
-documented history: domain fronting (relying on a CDN's SNI/Host mismatch) is dead because
-major CDNs (Google, Cloudflare, AWS) disabled it; commercial VPN providers are blocked within
-days of launch because their exit servers sit on a small, enumerable set of datacenter IP
-ranges, regardless of how well the tunnel protocol is disguised.
+### 1.1 Blocking has moved from "detect the bad protocol" to "permit only the good app"
 
-**Consequence for Warren:** protocol-level disguise (Module 2) is necessary but not
-sufficient. The durable defense is **making the set of endpoints too large, too ordinary,
-and too short-lived to blocklist** — which is exactly what the ISP Marketplace's model of
-ordinary residential nodes selling spare bandwidth already provides, if the routing and
-discovery layers are designed to exploit it.
+Detection-and-block is losing ground to allowlisting and to wholesale shutdown:
 
-### The two-layer model
+- **Regional mobile allowlists.** Russian authorities have repeatedly restricted
+  mobile internet in specific regions to a published whitelist of domestic
+  services during shutdown periods (reported from 2025 onward), rather than
+  attempting to enumerate and block circumvention protocols.
+- **National intranets.** Iran's National Information Network is built to keep
+  domestic services reachable while foreign connectivity is severed, and was
+  exercised during the near-total shutdown of June 2025.
+- **Whole-country shutdowns as routine policy.** Afghanistan's nationwide
+  fiber cut (September 2025) is the clearest recent case: nothing at the
+  protocol layer helps when the physical layer is administratively off.
+- **National firewall build-outs** outside the traditional set (e.g. Pakistan's
+  centralized web-management deployment, 2024–2025).
 
-```
-Layer 1 (structural):  ISP Marketplace node pool
-                        → thousands of ordinary residential IPs, constantly
-                          rotating as sellers join/leave the market
-                        → blocking cost for the censor scales with the number
-                          of households, not the number of "VPN companies"
+**Design consequence:** "indistinguishable from generic HTTPS" is necessary but
+bounded. Warren needs an explicit **degradation ladder** (§6.5) whose lower rungs
+do not assume foreign HTTPS is reachable at all, and it must state plainly where
+the ladder ends — against an enforced allowlist with no permitted foreign
+endpoint, no network-layer trick wins.
 
-Layer 2 (protocol):    Privacy Gateway camouflage
-                        → each individual connection, to a passive AND active
-                          observer, looks like a real visit to a real site
-                        → defeats DPI signature matching + active probing
-```
+### 1.2 Throttling has partly replaced blocking
 
-This mirrors the precedent set by Psiphon/Snowflake (structural defense via large,
-ephemeral, volunteer-run proxy pools) combined with the REALITY protocol (state-of-the-art
-protocol camouflage that survives active probing) — rather than inventing a new approach
-from scratch, Warren composes two independently-proven patterns on top of infrastructure
-(the Marketplace) it already needed for its bandwidth-trading business.
+Blocking is visible and politically expensive; degrading a service until users
+abandon it is neither. Russia's TSPU-based throttling of specific platforms is
+the reference case. A circumvention transport that treats "connected" as success
+will report itself healthy while being unusable.
 
-### Design implication
+**Design consequence:** health signals must be goodput- and
+completion-based, not reachability-based (§7.3), and the measurement layer must
+distinguish *blocked* from *degraded* (§9).
 
-Module 1 (ISP Marketplace) is no longer just a revenue mechanism — it is reclassified as
-**primary infrastructure for censorship resistance**, with Module 2 (Privacy Gateway) as the
-per-connection camouflage layer riding on top of it. This changes one thing operationally:
-marketplace node selection for a censorship-evasion session should prefer **node diversity
-and churn** (many small residential sellers) over **node quality** (few large, stable,
-high-bandwidth sellers) — the opposite of what a pure bandwidth-marketplace optimizer would
-pick. The routing algorithm needs a `mode=resilience` weighting that trades some throughput
-for endpoint diversity.
+### 1.3 Classification is statistical, and cheap
 
----
+Flow classification using packet-size distributions, inter-arrival timing, and
+handshake-shape features is commodity work now, and entropy-based detection of
+"fully encrypted" protocols has been deployed in production by at least one
+state-scale censor. Payload-signature evasion is no longer the frontier.
 
-## Module Specifications
+**Design consequence:** L1 must mimic a *live* browser profile (§6.2), and
+traffic-shape defenses must be specified with an honest cost model — the earlier
+"constant-rate cover traffic" line was both unbudgeted and, in a marketplace
+where bandwidth is billed per GB, self-contradictory (§6.4).
 
-### Module 1: ISP Marketplace
+### 1.4 Post-quantum handshakes are the common case
 
-#### Architecture
+NIST standardized ML-KEM (FIPS 203), ML-DSA (FIPS 204) and SLH-DSA (FIPS 205) in
+August 2024, and draft NIST IR 8547 puts classical public-key crypto on a path to
+deprecation around 2030 and disallowance by 2035. Independently of policy, the
+hybrid group **X25519MLKEM768** now ships by default in mainstream browsers and is
+supported across major CDNs, so a large and growing share of real TLS 1.3
+handshakes carry a hybrid PQ key share — and a correspondingly large ClientHello
+(~1.5–2 KB, frequently spanning multiple TCP segments).
 
-```
-┌─────────────────────────────────────────┐
-│      Marketplace Smart Contract         │
-│  (Ethereum/Solana)                      │
-│  - Bandwidth listing                    │
-│  - Transaction settlement               │
-│  - Reputation tracking                  │
-└─────────────────────────────────────────┘
-          ↑                    ↑
-    [Seller Node]         [Buyer Node]
-    Advertises:           Purchases:
-    - Bandwidth           - Encrypted tunnel
-    - Price per GB        - Auto-settlement
-    - Uptime SLA
-```
+**Design consequence, and the single most actionable item in this revision:** a
+ClientHello that mimics a 2023 browser (no `key_share` for a hybrid group, ~500
+bytes, one segment) is *anomalous in 2026*. Warren's current PoC pins uTLS's
+Chrome-120 profile, which has exactly this problem (§6.2). Camouflage profiles are
+now perishable goods and need a refresh process, not a constant.
 
-#### Smart Contract Interface
+The same standardization wave applies to Warren's own data plane: traffic recorded
+today is decryptable later under a harvest-now-decrypt-later assumption, so the
+Warren session handshake itself must be hybrid PQ (§11).
 
-```solidity
-contract WarrenISPMarketplace {
-  // Seller registers available bandwidth
-  function listBandwidth(
-    uint256 bandwidthMbps,
-    uint256 pricePerGB,
-    uint256 uptimeSLApercent
-  ) external;
-  
-  // Buyer initiates transaction
-  function purchaseBandwidth(
-    address seller,
-    uint256 amountGB,
-    uint256 maxPricePerGB,
-    bytes32 encryptionKeyHash
-  ) external payable;
-  
-  // Settle after usage
-  function settle(
-    bytes32 transactionId,
-    uint256 actualBytesUsed,
-    bytes calldata proof
-  ) external;
-  
-  // Reputation system
-  function rateNode(
-    address node,
-    uint8 rating,
-    string calldata comment
-  ) external;
-}
-```
+### 1.5 The client is a chokepoint, and so is the operator
 
-#### Settlement Model: Hybrid On-Chain + Off-Chain
+Two non-network attack surfaces have proven more effective than DPI:
 
-**Problem:** Every settlement on-chain = gas fees can exceed transaction value.
-
-**Solution:** **Off-chain Payment Channels** (similar to Lightning Network):
-
-```
-1. Buyer deposits tokens to smart contract (locks collateral)
-2. Buyer ↔ Seller exchange SIGNED receipts off-chain (no gas)
-3. Every N hours or when dispute occurs: final settlement posted on-chain
-4. Result: 1000x reduction in blockchain overhead
-```
-
-#### Data Structures
-
-```protobuf
-message MarketplaceNode {
-  string node_id;
-  uint32 bandwidth_mbps;
-  float price_per_gb;
-  uint8 uptime_sla_percent;
-  repeated Rating ratings;
-  uint64 reputation_score;
-  repeated Transaction transactions;
-  string payment_channel_address;  // Off-chain channel identifier
-}
-
-message Transaction {
-  string transaction_id;
-  string seller_id;
-  string buyer_id;
-  uint32 amount_gb;
-  float price_per_gb;
-  int64 timestamp;
-  TransactionStatus status;
-  bytes encryption_key_hash;
-  uint64 actual_bytes_used;
-}
-```
-
-#### Node Implementation (Pseudocode)
-
-```go
-type MarketplaceNode struct {
-  NodeID           string
-  BandwidthMbps    uint32
-  PricePerGB       float32
-  UptimeSLA        uint8
-  ContractAddress  common.Address
-  Web3Client       *ethclient.Client
-}
-
-func (n *MarketplaceNode) ListBandwidth(ctx context.Context) error {
-  // 1. Calculate available bandwidth
-  available := n.BandwidthMbps - n.getCurrentUtilization()
-  
-  // 2. Publish to smart contract
-  tx, err := n.Contract.ListBandwidth(
-    &bind.TransactOpts{From: n.AccountAddress},
-    available,
-    n.PricePerGB,
-    n.UptimeSLA,
-  )
-  
-  // 3. Announce in DHT
-  n.DHT.Announce(fmt.Sprintf("marketplace:%s", n.NodeID))
-  
-  return err
-}
-
-func (n *MarketplaceNode) HandleBandwidthPurchase(
-  ctx context.Context,
-  buyerID string,
-  amountGB uint32,
-) (*Tunnel, error) {
-  // 1. Verify buyer's payment on-chain
-  // 2. Generate encrypted tunnel (ChaCha20-Poly1305)
-  // 3. Return tunnel config to buyer
-}
-```
+- **Distribution.** VPN applications have been removed from national app-store
+  fronts on government demand (Russia, 2024, and similar pressure elsewhere).
+  A circumvention tool that can only be installed from two app stores is
+  blockable by email.
+- **Operator liability.** Selling residential bandwidth to strangers is
+  structurally identical to the residential-proxy market, whose abuse history
+  brought law-enforcement action (e.g. the 911 S5 takedown, 2024) and continued
+  criminal monetization of residential IPs through 2025. A Warren seller whose
+  home IP is used for fraud, intrusion, or CSAM distribution faces real legal and
+  ISP-contractual exposure. The original design had *nothing* to say about this;
+  it is now §7.4, and it is a precondition for anyone sane to run a node.
 
 ---
 
-### Module 2: Privacy Gateway (DPN)
+## 2. Scope & Non-Goals
 
-#### Design Philosophy
+Warren operates at the **network layer**. Its purpose is **censorship
+resistance**: making it structurally hard for a state-level adversary to *block*
+a connection, and making an individual connection *indistinguishable from
+ordinary current-generation HTTPS traffic* to passive DPI, statistical
+classifiers, and active probing.
 
-**Goal:** Governments can inspect *intent* (what user is doing), but cannot inspect *data* (specific content). **Protocols themselves must be stealthy.**
+Anonymity is not a single property — it splits into three layers, and Warren only
+addresses one of them. Being explicit about this boundary is a security property
+in itself: a system that implies protections it does not provide gets users hurt.
 
-```
-Without Privacy Gateway (traditional VPN):
-  [User] → [Entire packet encrypted] → [VPN Server]
-  Result: Government can't see anything → bans it
+| Layer | What it hides | Warren's coverage |
+|-------|---------------|-------------------|
+| **Network reachability** | Your IP/location from blocklists; the fact that a connection is a circumvention tunnel | **In scope** — this is Warren's core (residential relay pool + camouflaged transport) |
+| **Traffic metadata / timing correlation** | *That* you communicated with a given endpoint, inferable from packet timing and volume | **Partial / best-effort, opt-in cost** — bucketed sizing and padding regimes raise the bar; Warren is a relay network, **not** a mixnet, and end-to-end timing correlation by an adversary who sees both ends is out of scope |
+| **Identity** | *Who you are*: browser fingerprint, logged-in accounts, payment trail, writing style | **Out of scope** — Warren carries bytes; it cannot unlink an account you log into or a browser that is uniquely fingerprintable |
 
-With Privacy Gateway (Warren):
-  [User] → [HTTPS/TLS Disguise Layer] → [Policy: "news"] [Content: encrypted] → [DPN Server]
-  Result: Government sees "normal HTTPS web traffic" + doesn't see Warren metadata
-```
+### Explicit non-goals
 
-**Forward-looking risk:** full VPN bans (as opposed to VPN-protocol detection) are moving
-toward **application whitelisting** — permitting only a fixed set of domestic apps (e.g.
-WeChat-class traffic) rather than trying to detect and block every foreign protocol. If a
-region moves to this model, "looking like generic HTTPS" stops being sufficient, and the
-camouflage target needs to shift toward mimicking an explicitly whitelisted app's traffic
-pattern rather than a generic popular website. This is out of scope for the current
-implementation phase but should inform which sites are chosen as REALITY targets per region.
+- **Not an anonymity network in the Tor sense.** No sender–receiver unlinkability
+  against an adversary observing both ends. If your threat model includes global
+  traffic correlation, compose Warren with a mixnet (Nym/Loopix-class), not Warren
+  alone.
+- **Not identity protection above the network layer.** Fingerprinting, cookies,
+  logged-in sessions, payment identifiers, and stylometry are outside its reach.
+  Run a fingerprint-resistant client *over* Warren.
+- **Not a "trust us" VPN.** Warren avoids concentrating trust in one
+  operator-controlled exit set, and therefore cannot make the latency or
+  simplicity guarantees a centralized VPN can.
+- **Not a defense against physical-layer shutdown.** When connectivity is
+  administratively severed, Warren degrades to local/mesh operation (§10) and says
+  so; it does not pretend to route around a cut fiber.
+- **Not a coin.** The core protocol must be fully functional with settlement
+  disabled (§8). No part of reachability may depend on a token's existence, price,
+  or a chain's liveness.
 
-#### Protocol Camouflage: REALITY-Style TLS Borrowing (Critical for Censorship Evasion)
-
-**Problem:** If Warren packets have recognizable headers/signatures, government DPI systems
-will blacklist them immediately (by IP/ASN blocking). Worse, **naive SNI spoofing does not
-work**: if a client's TLS ClientHello claims `SNI = www.google.com` while the destination IP
-is a Warren node (not a Google-owned IP/ASN), a state-level DPI system that correlates
-SNI-to-IP ownership flags this immediately. Domain fronting (routing through a real CDN edge
-that hosts the spoofed name) is the correct fix for this specific failure mode, but is
-largely closed off — major CDNs disabled cross-domain fronting after it was weaponized for
-circumvention.
-
-**Solution:** **REALITY-style TLS session borrowing**, not SNI spoofing:
-
-- Each Privacy Node is paired with a real, currently-popular HTTPS site it can legitimately
-  proxy a TLS handshake through (the actual target of the handshake is real — the node does
-  not fabricate a certificate or claim an identity it can't back up)
-- A Warren client's traffic is authenticated via a short cryptographic tag embedded in the
-  TLS ClientHello's otherwise-unused extension bytes, verifiable only by the target Privacy
-  Node's private key. To anyone else — including active probes — the connection is
-  indistinguishable from a real visit to the real site, because for non-Warren clients it
-  genuinely **is** a real visit (the Privacy Node relays to the real site by default,
-  identical to how xray-core's REALITY protocol operates)
-- **Active probing resistance:** if a censor's probe connects and does not present the
-  correct authentication tag, the Privacy Node transparently proxies to the real site with a
-  real, valid certificate chain — the probe sees a legitimate site and has nothing to flag
-- This is a different failure mode fix than plain protocol mimicry: mimicry can be detected
-  by an adversary who tries the handshake themselves and notices the "site" doesn't behave
-  like the real one (session resumption gaps, ALPN mismatches, etc.); TLS borrowing avoids
-  this because the fallback path *is* the real site
-
-**Decentralized bootstrap / discovery:** node addresses and the site-pairing list must not be
-served from a single central endpoint — that endpoint becomes the first thing blocked. Follow
-the Tor-bridge precedent: distribute via multiple independent, low-volume out-of-band
-channels (e.g., rotating subsets shared via email autoresponders, encrypted messaging
-channels) in addition to DHT discovery, so no single choke point exists.
-
-**Traffic shape normalization:** small random padding (a few dozen bytes) is not sufficient
-against ML-based flow classifiers, which fingerprint packet-size distributions and inter-
-arrival timing rather than payload signatures — this is a well-documented weakness in
-website-fingerprinting research even against Tor. Warren instead normalizes VDI/data-plane
-traffic into a small number of fixed packet-size buckets and injects constant-rate cover
-traffic during idle periods, so the observable bandwidth profile stays flat regardless of
-underlying activity.
-
-#### Policy Engine
-
-```yaml
-# User's privacy policy (stored locally, never leaves device)
-policies:
-  news:
-    categories: [politics, international, tech, science]
-    encryption: required
-    transparency: intent_only
-  
-  education:
-    categories: [university, online_courses, research]
-    encryption: required
-    transparency: metadata_only  # Teacher can see attendance, not content
-  
-  medical:
-    categories: [health, pharmacy, mental_health]
-    encryption: required
-    transparency: none  # Completely hidden
-  
-  social:
-    categories: [messaging, social_media]
-    encryption: optional
-    transparency: metadata_only
-```
-
-#### DPN Route Selection Algorithm
+### The intended composition
 
 ```
-For each packet:
-  1. Extract: destination IP, destination port
-  2. Classify: which policy category does this belong to?
-  3. Determine: transparency level (intent_only, metadata_only, none)
-  4. Select route:
-     a) If privacy: use Warren ISP Marketplace (cheapest + fastest encrypted path)
-     b) If metadata_only: use mixed path (some transparent hops, some encrypted)
-     c) If intent_only: use public path + policy header only
-  5. Add: encryption wrapper (ChaCha20-Poly1305)
-  6. Forward: through selected route
+[Fingerprint-resistant client: Tor Browser / hardened app]   <- identity layer (NOT Warren)
+                        |
+[Optional: mixnet for timing defense]                        <- metadata layer (NOT Warren)
+                        |
+[Warren: unblockable, camouflaged network transport]          <- reachability layer (THIS project)
+                        |
+[Hostile network / censored ISP]
 ```
 
-#### Data Flow
-
-```protobuf
-message PrivacyPacket {
-  // Visible to all nodes (for routing)
-  string policy_category;         // "news", "education", etc.
-  int64 timestamp;
-  string source_node_id;
-  
-  // Encrypted (only destination can decrypt)
-  bytes content;                  // Actual user data
-  bytes encryption_nonce;
-  string encryption_key_hash;     // Matches blockchain record
-}
-```
-
-#### Implementation (Pseudocode)
-
-```go
-type PrivacyGateway struct {
-  UserPolicies   map[string]*PolicyRule
-  DHT            *dht.DHT
-  EncryptionKey  *chacha20poly1305.ChaCha20Poly1305
-  RouteCache     *lru.Cache
-}
-
-func (pg *PrivacyGateway) ProcessPacket(pkt *Packet) (*RoutedPacket, error) {
-  // 1. Classify packet
-  category := pg.classifyDestination(pkt.DestIP, pkt.DestPort)
-  policy := pg.UserPolicies[category]
-  
-  // 2. Determine transparency
-  transparency := policy.Transparency
-  
-  // 3. Find best route
-  route := pg.selectRoute(category, policy, pkt)
-  
-  // 4. Encrypt content
-  ciphertext, nonce := pg.encrypt(pkt.Payload)
-  
-  // 5. Create privacy packet
-  privacyPkt := &PrivacyPacket{
-    PolicyCategory:   category,
-    Timestamp:        time.Now().Unix(),
-    SourceNodeID:     pg.NodeID,
-    Content:          ciphertext,
-    EncryptionNonce:  nonce,
-    EncryptionKeyHash: hashKey(pg.EncryptionKey),
-  }
-  
-  // 6. Route through selected path
-  return &RoutedPacket{
-    Route:          route,
-    Content:        privacyPkt,
-    Transparency:   transparency,
-  }, nil
-}
-```
+Warren's contribution is the bottom layer: **when the network itself is trying to
+stop you from connecting at all, Warren is what still gets a connection through.**
 
 ---
 
-### Module 3: Independence Verification & Logger
+## 3. Design Principles
 
-**Design note:** this module is split into two independent proofs with different purposes.
-An earlier draft proposed replacing all on-chain evasion logging with a purely local
-authentication proof, on the grounds that logging evasion metadata anywhere is a privacy
-mistake. That's correct for *authentication*, but conflating it with *logging* would remove
-the aggregate censorship statistics that the Independence Logger revenue line (NGO/research
-data subscriptions, $20K–100K/year per the business plan) depends on. The two are kept
-separate below so neither goal compromises the other.
+These are the rules the rest of the document is accountable to.
 
-#### 3a. ZK-Passport: Local Handshake Authorization (no on-chain trace)
-
-Used at P2P handshake time to prove "this is a node holding a valid independence passport"
-without revealing which node, and without ever touching the blockchain. Verified peer-to-peer
-between the two handshaking nodes only.
-
-**Unlinkability requirement:** a static commitment (e.g. `hash(secret, hardware_serial)`)
-reused across sessions is itself a fingerprint — repeated presentation of the same commitment
-across different relays/times lets a correlating observer link sessions to the same device,
-defeating the purpose. Each handshake must instead present a **fresh nullifier** derived from
-the same underlying secret (Semaphore-style), so two sessions from the same device are
-provably from *a* valid passport-holder but not provably from the *same* one.
-
-```
-Circuit inputs:
-  private: passport_secret, hardware_binding
-  public:  passport_commitment (registered once, off-chain, with the issuing node)
-           session_nullifier = hash(passport_secret, session_epoch)
-
-  Proves:  commitment = hash(passport_secret, hardware_binding)   [knowledge of a valid passport]
-       AND session_nullifier correctly derived from passport_secret for this session_epoch
-       WITHOUT revealing passport_secret or hardware_binding
-
-Result exchanged over the wire: only (session_nullifier, proof) — never the commitment,
-never a wallet address, never touches the blockchain.
-```
-
-#### 3b. Aggregate Evasion Logger (on-chain, opt-in, statistics only)
-
-This is the existing Independence Logger design below, **unchanged** — it remains the
-mechanism that produces the region-level censorship statistics sold to NGOs/researchers.
-Two things distinguish it from 3a and keep it privacy-safe:
-
-- It is **opt-in** and produces only aggregate/batched counts, not per-session records
-  correlatable to a specific user's browsing
-- It uses the same relayer-assisted anonymity model already designed below, so individual
-  wallet addresses never appear on-chain even for this aggregate reporting
-
-#### Zero-Knowledge Proof (ZKP) Generation
-
-When a user successfully evades censorship, Warren generates a **non-interactive ZKP** proving:
-- "I successfully bypassed firewall X"
-- WITHOUT revealing: the specific data transmitted, source/destination IPs, exact timestamps
-
-```
-Proof Structure:
-  commitment = hash(firewall_id, evasion_timestamp, random_nonce)
-  witness = (firewall_id, evasion_timestamp, random_nonce)
-  proof = zkp_prove(commitment, witness)
-```
-
-#### Blockchain Recording with Anonymity Protection
-
-**Problem:** If user wallet address (`msg.sender`) is revealed on-chain, wallet tracking can de-anonymize the user.
-
-**Solution:** **Relayer-Assisted Anonymous Proof Submission**:
-
-- User generates ZKP locally (never broadcasts wallet address)
-- User submits proof to Warren's **anonymous Relayer nodes** (multi-hop, encrypted)
-- Relayer (trusted Warren infrastructure node) pays gas fee from relayer's own wallet
-- On-chain transaction shows: Relayer address → Proof Hash (user wallet is never on-chain)
-- Relayer is periodically rotated and collateral-bonded to prevent collusion
-
-```solidity
-contract WarrenIndependenceLogger {
-  // Relayers are bonded, rotating addresses (prevents tracking)
-  mapping(address => uint256) public relayerBond;
-  address[] public activeRelayers;
-  
-  event CensorshipEvaded(
-    bytes32 indexed proofHash,
-    string region,
-    int64 timestamp,
-    bytes zkProof,
-    address relayerAddress  // NOT user wallet
-  );
-  
-  function logEvasionViaRelayer(
-    bytes32 proofHash,
-    string region,
-    bytes calldata zkProof,
-    bytes calldata relayerSignature  // Proves relayer submitted this
-  ) external {
-    require(verifyRelayerSignature(relayerSignature), "Invalid relayer signature");
-    require(verifySingleProof(zkProof, proofHash), "Invalid proof");
-    emit CensorshipEvaded(proofHash, region, block.timestamp, zkProof, msg.sender);
-  }
-  
-  function getRegionStats(string region, uint64 timeframe) 
-    public view returns (uint256 evasionCount) {
-    // Query events filtered by region and timeframe (no wallet linking)
-  }
-}
-```
-
-#### Implementation (Pseudocode)
-
-```go
-type IndependenceProof struct {
-  ProofID        string
-  Region         string
-  Timestamp      int64
-  FirewallID     string
-  ZKProof        []byte           // Serialized ZKP
-  BlockchainHash string           // Tx hash on-chain
-  Verified       bool
-}
-
-func (logger *IndependenceLogger) ProveEvasion(
-  ctx context.Context,
-  firewallID string,
-  location string,
-) (*IndependenceProof, error) {
-  // 1. Record event (local)
-  timestamp := time.Now().Unix()
-  nonce := generateRandomNonce()
-  
-  commitment := hash(firewallID, timestamp, nonce)
-  
-  // 2. Generate ZKP (using libsnark or similar)
-  zkProof := generateZKP(commitment, []byte{}, nonce)
-  
-  // 3. Publish to blockchain
-  txHash, err := logger.Contract.LogEvasion(
-    &bind.TransactOpts{From: logger.AccountAddress},
-    commitment,
-    location,
-    zkProof,
-  )
-  
-  // 4. Wait for confirmation
-  receipt := waitForReceipt(ctx, logger.Web3Client, txHash)
-  
-  return &IndependenceProof{
-    ProofID:        generateUUID(),
-    Region:         location,
-    Timestamp:      timestamp,
-    FirewallID:     firewallID,
-    ZKProof:        zkProof,
-    BlockchainHash: txHash,
-    Verified:       receipt.Status == 1,
-  }, nil
-}
-
-func (logger *IndependenceLogger) GetRegionStats(
-  ctx context.Context,
-  region string,
-  days int,
-) (*CensorshipStats, error) {
-  // Query blockchain for all CensorshipEvaded events in region
-  // Filter by timestamp
-  // Aggregate counts
-  return &CensorshipStats{
-    Region:       region,
-    TimeframeDays: days,
-    EvictionCount: count,
-    Timestamp:     time.Now().Unix(),
-  }, nil
-}
-```
+1. **Reuse audited implementations for anything cryptographically deep.** The
+   REALITY authentication path, ZK circuits, and PQ KEMs are not places to
+   innovate. Where Warren has a hand-rolled version (the current static-PSK
+   transport), the migration target is a maintained upstream implementation, and
+   that is recorded as a gap, not a feature.
+2. **Every layer must fail independently.** Discovery failing must not break
+   established sessions; settlement failing must not break routing; measurement
+   failing must not break anything.
+3. **No privacy liability without a revenue or safety justification that survives
+   a hostile reading.** Applied here, it retired per-event on-chain evasion logs
+   (§14): the analytics product needs regional aggregates, and aggregates do not
+   require publishing "someone in region X evaded censorship at time T" to an
+   immutable public ledger.
+4. **Perishable defenses need refresh machinery, not constants.** Camouflage
+   profiles, fallback site pairings, and bridge distribution channels all expire.
+   Anything with a shelf life gets an update path and a staleness alarm.
+5. **Gates, not dates.** Each roadmap slice states a falsifiable pass condition
+   (§16). "Survives the active-probe harness" is a gate; "Month 6" is not.
+6. **State costs in the units users pay.** Latency, gigabytes, battery, dollars.
+   A defense whose overhead is not written down is a defense that will be turned
+   off in production.
 
 ---
 
-### Module 4: Satellite Fallback
-
-#### Failover Logic with Traffic Tiering
-
-**Problem:** LoRa mesh operates at kilobit/s speeds. Routing VDI (screen streaming, MB/s) or Thump workloads (GB-scale migration) through LoRa causes network collapse.
-
-**Solution:** **Strict Traffic Tiering** — LoRa restricted to Control Plane only:
+## 4. Layered Architecture
 
 ```
-Primary Connection Health Monitor:
-  ├─ Latency check (every 3 seconds)
-  ├─ Packet loss detection (every 10 seconds)
-  ├─ Bandwidth measurement (every 30 seconds)
-  └─ Reputation score: (latency + loss + bandwidth) → health%
-
-Failover Trigger:
-  IF health < 60% OR latency > 500ms THEN
-    
-    IF still_have_satellite_uplink (Starlink/Kuiper):
-      → Route through satellite (maintains data plane)
-      → Continue VDI, Thump workloads normally
-    
-    ELSE IF LoRa_mesh_available:
-      → STOP all data plane traffic (VDI, workload migration)
-      → LoRa carries ONLY control plane:
-         • Thump heartbeat signals (alive/dead status)
-         • Emergency control commands (pause, resume, checkpoint)
-         • Warren mesh announcements (DHT updates)
-      → Hold workload migration requests until ground network recovers
-      → Notify user: "Network resilience mode (control only)"
-      
-    ELSE:
-      → Total network loss
-      → Local cache serving only (Crovi cached desktop images, etc.)
+L4  Measurement        private aggregate telemetry (opt-in)         [not started]
+L3  Accounting         offline credits; optional on-chain settle    [sketch only]
+L2  Relay pool         path selection, reputation, abuse policy     [not started]
+L1  Transport          camouflaged, PQ-hybrid, pluggable            [PoC]
+L0  Discovery          multi-channel bridge + client distribution   [implemented]
 ```
 
-**Bandwidth Guarantee:**
-- LoRa throughput: ~50 bps - 50 kbps (depending on range)
-- Control plane packets: ~100 bytes/message
-- Capacity: ~500 control messages/second (sustainable heartbeat)
-- Data plane: Explicitly disabled with DROP rule
+Control plane and data plane are separate: L0/L4 are control, L1/L2 are data, L3
+is out-of-band with respect to both. Node types collapse from the original five
+to three **roles** (a process may hold several):
 
-#### Node Implementation
+| Role | Responsibility |
+|------|----------------|
+| **Client** | Originates traffic, resolves bridges, selects paths, enforces local policy |
+| **Relay** | Accepts camouflaged connections, forwards, optionally sells capacity; borrows a TLS identity from a real site it can actually reach |
+| **Exit** | Egresses to the open internet under a declared exit policy (§7.4). **Explicitly a distinct role** — running a relay must not implicitly make a home connection an exit |
 
-```go
-type SatelliteNode struct {
-  NodeID              string
-  StarlingClient      *starlink.Client      // Starlink API
-  KuperClient        *kuiper.Client        // Amazon Kuiper API
-  LoRaMesh           *lora.MeshController
-  
-  PrimaryRoute       *Route
-  FailoverRoutes     []*Route
-  
-  HealthMonitor      *HealthMonitor
-}
-
-func (sn *SatelliteNode) MonitorPrimaryHealth(ctx context.Context) {
-  ticker := time.NewTicker(3 * time.Second)
-  defer ticker.Stop()
-  
-  for range ticker.C {
-    latency := measureLatency()
-    loss := measurePacketLoss()
-    bandwidth := measureBandwidth()
-    
-    health := (1.0 - loss/100.0) * (1000.0 / (latency + 1)) * (bandwidth / 100.0)
-    
-    if health < 0.6 || latency > 500 {
-      sn.ActivateFailover(ctx)
-    }
-  }
-}
-
-func (sn *SatelliteNode) ActivateFailover(ctx context.Context) error {
-  // Try Starlink first (lower latency)
-  if sn.tryStarlink(ctx) == nil {
-    sn.trafficMode = "FULL_DATA_PLANE"  // All traffic allowed
-    return nil
-  }
-  
-  // Fallback to Kuiper
-  if sn.tryKuiper(ctx) == nil {
-    sn.trafficMode = "FULL_DATA_PLANE"  // All traffic allowed
-    return nil
-  }
-  
-  // Last resort: LoRa mesh (CONTROL PLANE ONLY)
-  if sn.tryLoRaMesh(ctx) == nil {
-    sn.trafficMode = "CONTROL_PLANE_ONLY"  // DROP data plane traffic
-    sn.dropDataPlaneTraffic()             // Pause VDI, workload migration
-    sn.enableControlHeartbeat()           // Enable heartbeat + control commands
-    sn.notifyThump("resilience_mode_activated")  // Notify Thump
-    return nil
-  }
-  
-  // All failed
-  sn.trafficMode = "LOCAL_CACHE_ONLY"  // Serve from local cache only
-  return errors.New("all failover routes exhausted")
-}
-
-func (sn *SatelliteNode) dropDataPlaneTraffic() {
-  // Explicitly drop VDI streams, workload data
-  sn.policyEngine.SetRule("VDI_*", "DROP")
-  sn.policyEngine.SetRule("THUMP_WORKLOAD_MIGRATION", "DROP")
-  log.Info("Data plane traffic blocked: LoRa control-plane-only mode")
-}
-
-func (sn *SatelliteNode) enableControlHeartbeat() {
-  // Small, frequent heartbeat packets (~100 bytes every 5 seconds)
-  go func() {
-    ticker := time.NewTicker(5 * time.Second)
-    for range ticker.C {
-      sn.sendHeartbeatViaLoRa()  // Proves node is alive
-    }
-  }()
-}
-
-func (sn *SatelliteNode) tryStarlink(ctx context.Context) error {
-  gateway, err := sn.StarlingClient.GetNearestGateway(
-    ctx,
-    sn.CurrentLocation.Latitude,
-    sn.CurrentLocation.Longitude,
-  )
-  
-  if err != nil {
-    return err
-  }
-  
-  // Establish connection
-  conn, err := sn.StarlingClient.EstablishTunnel(ctx, gateway)
-  
-  // Update routing table
-  sn.PrimaryRoute.Failover = conn
-  
-  return nil
-}
-```
-
-#### LoRa Mesh Incentive Model
-
-```protobuf
-message LoRaRelayReward {
-  string relay_node_id;
-  uint64 bytes_relayed;
-  uint32 uptime_percent;
-  
-  // Token reward = base_rate * bytes_relayed * uptime_factor
-  float base_rate = 0.00001;  // tokens per byte
-  float reward = bytes_relayed * uptime_percent / 100.0 * base_rate;
-}
-
-// Settlement every 24 hours on-chain
-```
+The earlier "Privacy Node / Logger Node / Satellite Node" taxonomy is folded in:
+policy enforcement is a client concern, measurement is a control-plane service,
+and satellite/mesh is a link type available to any role (§10).
 
 ---
 
-## Integration Layer
+## 5. L0 — Discovery & Client Distribution
 
-### Crovi Integration
+**Status: implemented** (`internal/discovery/bootstrap`) for bridge resolution;
+distribution hardening not started.
 
-```
-┌─────────────────────────────────────┐
-│     Crovi VDI Authentication        │
-│     (OIDC, SSO)                     │
-└─────────────────────────────────────┘
-           ↓
-┌─────────────────────────────────────┐
-│     Warren Policy Injection         │
-│     (User → Policy Rules)           │
-└─────────────────────────────────────┘
-           ↓
-┌─────────────────────────────────────┐
-│    Warren Privacy Gateway           │
-│    (Auto-encrypt VDI traffic)       │
-└─────────────────────────────────────┘
-           ↓
-┌─────────────────────────────────────┐
-│    Warren ISP Marketplace           │
-│    (Route via cheapest path)        │
-└─────────────────────────────────────┘
-```
+The implemented design is unchanged in principle and remains correct: `Multi`
+queries every configured resolver concurrently, merges all successes, and returns
+a per-channel report so a client survives channels being blocked one at a time and
+operators can see *which* channel is blocked in which region. Resolvers today:
+DNS TXT (injectable lookup), local bridge file (the landing point for
+out-of-band distribution), and a compiled-in static list of last resort.
 
-### Thump Integration
+### 5.1 Additions required by the 2026 environment
 
-```
-Thump Event: Workload Failover Detected
-    ↓
-Warren Satellite Fallback: Check connection health
-    ↓
-IF primary_route_compromised THEN
-  - Thump migrates workload
-  - Warren re-provisions network path
-  - Zero-downtime transition
-ELSE
-  - Normal failover (no network change)
-```
+- **Encrypted-transport resolvers.** Plain DNS TXT is trivially tampered with at
+  the resolver. Add DoH/DoQ resolvers, and treat an unencrypted DNS answer as
+  untrusted input requiring signature verification.
+- **Signed bridge lists.** Every bridge list, regardless of channel, carries a
+  detached signature over `(bridges, issued_at, expiry)` verified against a key
+  shipped in the client. This makes a hostile channel a denial-of-service
+  problem, not an attack that can steer clients onto censor-run relays.
+- **Client distribution as an L0 concern.** Bridges are useless without a client.
+  Required: reproducible builds, verifiable release artifacts, and at least three
+  distribution channels that are not the two mainstream app stores (direct
+  download with signature, F-Droid-style repository, and a peer-to-peer/sideload
+  path). A blocked update channel must degrade to "old client keeps working with
+  stale bridges", never to "client cannot start".
+- **Staleness is a first-class state.** A client whose newest signed bridge list
+  is older than its expiry reports *stale discovery*, not *no bridges*, and keeps
+  trying every channel with jittered backoff.
+
+### 5.2 Explicit non-mechanism
+
+Warren does **not** operate a central bridge-distribution API, nor publish a
+global relay list. Enumerability is the failure mode that kills relay pools
+(§7.2); discovery deliberately returns small, per-requester, rotating subsets.
 
 ---
 
-## Data Flow
+## 6. L1 — Transport & Camouflage
 
-### Complete User Session Flow
+**Status: proof of concept implemented** (`internal/network/transport`), with the
+gaps below. This is the layer where this revision changes the most.
+
+### 6.1 What exists
+
+A Warren client's first packet is a syntactically valid TLS 1.3 ClientHello built
+with [uTLS](https://github.com/refraction-networking/utls), carrying a 16-byte
+`HMAC-SHA256(psk, client_random)` tag in the `session_id` field (padded to the
+usual 32 bytes). The relay peeks the first record:
+
+- **Tag valid** → both sides derive a session key via HKDF from
+  `(psk, client_random)` and switch to AEAD framing (ChaCha20-Poly1305) on the
+  same TCP stream.
+- **Tag invalid, absent, or input isn't a well-formed ClientHello** → the raw
+  bytes are spliced byte-for-byte to a real fallback site, so a probe gets a
+  genuine response from a genuine service, because that is literally what
+  answered.
+
+This mechanism is the right one, and it is verified end-to-end. Its weaknesses are
+documented in `docs/protocol/reality-transport.md`; three of them are now design
+blockers rather than acceptable PoC debt.
+
+### 6.2 Camouflage profiles are perishable (new, blocking)
+
+The PoC pins `utls.HelloChrome_120` — a late-2023 profile with **no hybrid PQ key
+share**. In an environment where a large share of genuine browser handshakes offer
+`X25519MLKEM768`, that profile is a distinguisher rather than a disguise: it is
+both stale relative to the claimed browser version and small relative to the real
+size distribution.
+
+Required:
+
+- Track a **current** profile (uTLS `HelloChrome_Auto` / an explicit recent
+  profile such as `HelloChrome_133`), and treat the pinned version as a value that
+  expires. uTLS 1.8.x profiles for Chrome 131/133 include `X25519MLKEM768`.
+- **Handle the multi-segment ClientHello.** A ~1.7 KB hybrid ClientHello does not
+  arrive in one TCP segment. The tag lives at a fixed offset inside the first
+  record, so tag extraction still works, but the relay's record-boundary handling
+  and its 5-second sniff deadline must be re-validated against realistic segmented
+  arrival, not against the small 2023-shaped hello the tests currently exercise.
+- **Profile-refresh test.** CI asserts the active profile's key-share groups
+  include a hybrid PQ group, so the disguise can't silently rot.
+- **Per-region profile choice.** The right parrot is "what the local population
+  actually runs", which is not globally uniform. The profile is a configuration
+  input resolved alongside bridges (§5), not a compile-time constant.
+
+### 6.3 Pluggable transports (new)
+
+A single transport is a single point of failure. L1 is re-specified as an
+interface with several concrete implementations, selected per-bridge and
+per-region by the degradation ladder (§6.5):
+
+| Transport | Shape on the wire | Notes |
+|-----------|-------------------|-------|
+| `tls-borrow` (current) | TLS 1.3 to a real site, tagged hello, real-site fallback | Strongest against active probing; TCP only |
+| `masque` | HTTP/3 over QUIC; `CONNECT-UDP` (RFC 9298) / `CONNECT-IP` (RFC 9484) | Standards-based proxying, indistinguishable from the growing volume of real MASQUE traffic (Apple iCloud Private Relay, Cloudflare WARP). Dies wherever UDP/443 is blocked — which is common |
+| `websocket-tunnel` | Long-lived WSS inside an ordinary HTTPS site | The Tor WebTunnel pattern: cheap to host behind a real CDN-fronted site |
+| `rendezvous` | Browser-sourced WebRTC (Snowflake pattern) | Last-resort reachability when all fixed relays are blocked; low throughput |
+
+Selection is a policy, and policies are local. The client never receives "use
+transport X" as an instruction from the network without verifying it against a
+signed bridge descriptor.
+
+### 6.4 Traffic shaping, with a cost model (revised)
+
+The prior design specified "fixed-bucket packet sizing plus constant-rate cover
+traffic during idle periods". The mechanism is right; the specification was
+unusable for two reasons: no overhead budget, and — in a network where relays bill
+per gigabyte (§8) — constant-rate cover traffic means **paying a relay to carry
+noise**, continuously, on a residential uplink.
+
+Revised: three named regimes, client-selectable, each with a stated cost.
+
+| Regime | Mechanism | Overhead | When |
+|--------|-----------|----------|------|
+| `off` | No shaping beyond the transport's own record sizes | 0% | Default for throughput-bound use (VDI, bulk) |
+| `bucket` | Payload padded to a small set of fixed sizes; no injected idle traffic | Bounded, typically <15% of carried bytes | Default for interactive browsing |
+| `cover` | `bucket` plus constant-rate cover during idle, rate-capped and duty-cycled | Explicit: a configured bytes/hour ceiling the user opts into and pays for | Only where a named local threat justifies it |
+
+Honesty requirement: `cover` raises the cost of website-fingerprinting attacks; it
+does not defeat a determined classifier, and published padding-defense results
+(Tor's padding machines onward) are a record of partial mitigation, not solution.
+The doc must not claim otherwise, and the default must not be a regime whose bill
+the user did not agree to.
+
+### 6.5 Degradation ladder (new)
+
+The client walks down this ladder and reports which rung it is on. Each rung is a
+weaker but more survivable posture:
 
 ```
-1. User logs into Crovi (VDI)
-   └─ Crovi → Warren: "User XYZ logged in, assign policy set ABC"
-
-2. Warren Privacy Gateway receives VDI desktop traffic
-   └─ Classify: "User watching streaming video → policy: entertainment"
-   └─ Determine transparency: "intent_only" (hide specific URL)
-
-3. Warren routes through ISP Marketplace
-   └─ "Find me the cheapest 10Mbps path for entertainment category"
-   └─ Smart contract finds: "Node 5 selling 50Mbps @ $0.40/GB"
-
-4. Packet flow:
-   [VDI Traffic] 
-      → [Encryption: ChaCha20-Poly1305]
-      → [Warren Privacy Header: "entertainment"]
-      → [Route: Node5 → ISP Node7 → Public Internet]
-
-5. Independence Logger (optional)
-   └─ IF user is in censored region:
-      └─ Log "Successfully evaded censorship" to blockchain
-
-6. Satellite Failover (always active)
-   └─ Monitor: Node5 → ISP Node7 connection
-   └─ IF latency > 500ms:
-      └─ Failover to Starlink gateway
-
-7. Thump Integration (background)
-   └─ IF workload needs migration:
-      └─ Warren re-provisions entire network path to new node
+1. tls-borrow to a nearby residential relay            (normal operation)
+2. tls-borrow / websocket-tunnel behind a real CDN-fronted site
+3. masque to a large shared provider endpoint          (blends with real MASQUE)
+4. rendezvous (WebRTC/Snowflake pattern)               (throughput collapses)
+5. domestic-permitted-endpoint carriage                (where any allowlisted
+   endpoint can carry bytes; regionally specific, high risk, opt-in only)
+6. mesh / store-and-forward                            (no foreign reachability;
+   local control plane only, see §10)
+7. offline: local cache serving only
 ```
 
----
-
-## Security Model
-
-### Threat Model
-
-| Threat | Attacker | Mitigation |
-|--------|----------|-----------|
-| **Network eavesdropping** | ISP, government | End-to-end encryption (ChaCha20-Poly1305) |
-| **Metadata leakage** | Passive observer | Privacy-first routing + Protocol Camouflage (REALITY-style TLS borrowing) |
-| **SNI-to-IP correlation** | Government (Passive + list-based) | TLS borrowing routes to the *real* site's actual infrastructure, not a spoofed SNI on Warren-owned IPs |
-| **Active probing** | Government (connects back to suspected server) | Non-authenticated connections fall through to a genuine proxied response from the real site — nothing to flag |
-| **IP/ASN blocklisting of exit nodes** | Government (bulk block by network range) | Node-scale defense — ISP Marketplace's large, churning pool of residential nodes, not a small set of datacenter exits |
-| **Traffic analysis (ML flow classification)** | Sophisticated adversary | Fixed-bucket packet sizing + constant-rate cover traffic (not just random padding) |
-| **Session linkability across handshakes** | Passive/active correlator | ZK-Passport session nullifiers (Module 3a) — no static commitment reused across sessions |
-| **Wallet address tracking** | Blockchain analyst | Relayer-assisted anonymous proof submission (user wallet never on-chain); Module 3a proofs never touch chain at all |
-| **Node compromise** | Malicious ISP marketplace seller | Reputation system, collateral deposits, Off-chain payment channels |
-| **Blockchain attack** | 51% attacker | Use Ethereum/Solana (high security assumption) |
-| **Denial of Service** | Network-level attacker | Rate limiting per node, Proof-of-Work on queries |
-| **LoRa mesh overload** | Attacker flooding mesh | Control-plane-only traffic restriction on LoRa (data plane explicitly dropped) |
-| **Discovery/bootstrap takedown** | Government blocks the node-list source | Multi-channel decentralized bootstrap (DHT + out-of-band bridge distribution), no single broker |
-
-### Encryption Standards
-
-- **Transport:** ChaCha20-Poly1305 (default), AES-256-GCM (legacy)
-- **Key Exchange:** X25519 (Elliptic Curve Diffie-Hellman)
-- **Hashing:** SHA-256 or BLAKE3
-- **Random:** Crypto-secure RNG (getrandom on Linux, CNG on Windows)
-
-### Privacy Guarantees
-
-1. **Data Privacy:** No node (not even Warren core developers) can read user data
-2. **Metadata Privacy:** 
-   - Warren Privacy Gateway ensures ISP sees only policy intent
-   - REALITY-style TLS borrowing masks Warren connections as real visits to real sites,
-     surviving both passive DPI signature matching and active probing
-3. **Financial Privacy:** 
-   - Blockchain transactions are pseudonymous (address-based, not name-based)
-   - Off-chain Payment Channels eliminate on-chain gas fee overhead (no public ledger of micro-transactions)
-4. **Anonymity in Proof Submission:** 
-   - Module 3a (ZK-Passport handshake auth) never touches the blockchain and uses
-     per-session nullifiers, so device identity cannot be linked across sessions
-   - Module 3b (aggregate evasion logging) uses relayer-assisted anonymous submission —
-     user wallet address is never published on blockchain, and only aggregate counts are logged
-5. **Resilience Privacy:** 
-   - LoRa mesh restricted to control-plane-only (no data exfiltration risk)
-   - Location privacy maintained even during failover scenarios
-6. **Location Privacy:** LoRa + satellite failover obfuscate geographic location
-7. **Anti-Blocklisting (structural, not just cryptographic):**
-   - Exit/relay diversity comes from the ISP Marketplace's residential node pool, not a
-     small enumerable set of infrastructure IPs — see [Anti-Blocklisting Defense Model](#anti-blocklisting-defense-model)
+Rungs 5 and 6 are where an allowlist regime (§1.1) puts users, and both are honest
+about what they cannot do. The ladder's existence is the design's answer to
+§1.1 — not a claim that rung 1 always works.
 
 ---
 
-## Implementation Roadmap
+## 7. L2 — Relay Pool, Routing & Abuse Containment
 
-### Phase 1: ISP Marketplace MVP (Months 1–3)
+**Status: not started.** This layer carries the design's central bet.
 
-**Goals:**
-- [ ] Warren Core Protocol (P2P mesh, DHT)
-- [ ] Smart contract for bandwidth trading (Ethereum testnet)
-- [ ] Marketplace node implementation
-- [ ] Tunnel creation (ChaCha20-Poly1305)
-- [ ] Basic reputation system
+### 7.1 The two-layer anti-blocklisting model (retained)
 
-**Deliverables:**
-- CLI tool: `warren marketplace list`, `warren marketplace buy`
-- Local testnet with 5–10 nodes
-- Documentation
+State-scale censors block by IP/ASN reputation and by active probing, not
+primarily by decoding protocols. Commercial VPNs are blocked within days because
+their exits sit on small, enumerable datacenter ranges; domain fronting died when
+major CDNs disabled cross-domain SNI/Host mismatch. So:
 
-**Tech Stack:** Go + Solidity + libp2p
+```
+Layer 1 (structural):  a large pool of ordinary residential relays, churning as
+                       sellers join and leave
+                       -> the censor's blocking cost scales with the number of
+                          households, not the number of VPN companies
+
+Layer 2 (protocol):    per-connection camouflage (§6)
+                       -> each connection looks like a real visit to a real site,
+                          to passive DPI, statistical classifiers, and probes
+```
+
+This composes two independently proven patterns — large ephemeral proxy pools
+(Psiphon/Snowflake) and probe-resistant TLS borrowing (REALITY) — rather than
+inventing one. Module 1 is therefore **primary censorship infrastructure**, not
+just a revenue mechanism.
+
+### 7.2 Enumerability is the real adversary
+
+A pool's value is entirely in the censor's inability to enumerate it. Therefore:
+
+- **No global relay list exists anywhere**, including on any relay, and including
+  on-chain. This is the decisive argument against the original design's on-chain
+  bandwidth listings: a public contract that enumerates sellers, their capacity,
+  and their addresses is a censor's blocklist with a REST API and a permanent
+  archive. Listings must be private and query-scoped (§8.2).
+- **Discovery returns rotating per-requester subsets** (§5.2), rate-limited by
+  unlinkable tokens (§8.3) so enumeration costs the censor real resources.
+- **Selection prefers diversity and churn over quality.** For a resilience
+  session the router wants many small, short-lived residential endpoints — the
+  opposite of a throughput optimizer's choice. This is the `mode=resilience`
+  weighting: an explicit, measurable trade of throughput for endpoint diversity.
+
+### 7.3 Path selection and health
+
+Health is **goodput- and completion-based**, not reachability-based, because
+throttling is now a primary tactic (§1.2). Per-path signals: achieved goodput
+versus advertised, request-completion rate, latency distribution (not just mean),
+and handshake-failure rate. A path that connects and then delivers 40 kbit/s is
+*unhealthy*, and the router must say so rather than reporting success.
+
+Reputation is local-first: each client maintains its own scores, optionally
+seeded by signed aggregate hints. A globally shared reputation score is both an
+enumeration oracle and a sybil target.
+
+### 7.4 Abuse containment and operator liability (new, blocking)
+
+Nobody should run an exit without this, and the original design shipped no answer
+at all. Requirements:
+
+- **Relay ≠ exit.** Default installation makes a node a *relay only*. Becoming an
+  exit is a separate, explicit, informed action with jurisdiction-aware warnings.
+- **Declared exit policy, enforced locally.** Exits publish a machine-readable
+  policy (permitted ports/protocols, rate caps) in their signed descriptor, and
+  enforce it. Sensible default: no SMTP, no scanning-shaped traffic, aggressive
+  per-source rate limits.
+- **Abuse response path.** A documented complaint-handling procedure, per-exit
+  contact metadata, and templated ISP-response documentation — the operational
+  asset Tor exit operators rely on, which is what makes exit operation survivable.
+- **No logs that identify users, and that must be a design property, not a
+  promise.** An exit cannot answer "who sent this" if it never had the
+  information; the accounting design (§8) must therefore not require exits to
+  retain per-session user identifiers.
+- **Stated residual risk.** Selling residential bandwidth resembles the
+  residential-proxy market whose abuse invited law-enforcement action (§1.5).
+  Warren's countermeasures reduce but do not eliminate operator exposure, and the
+  onboarding flow must say that in plain language, before a user enables an exit.
 
 ---
 
-### Phase 2: Privacy Gateway + Logger (Months 4–6)
+## 8. L3 — Accounting & Settlement
 
-**Goals:**
-- [ ] Privacy-first routing protocol (DPN)
-- [ ] Policy engine (YAML-based user policies)
-- [ ] REALITY-style TLS borrowing (Module 2 protocol camouflage)
-- [ ] Decentralized bootstrap/discovery (multi-channel, no single broker)
-- [ ] ZK-Passport local handshake auth with session nullifiers (Module 3a)
-- [ ] Independence Logger aggregate ZKP generation (Module 3b)
-- [ ] Blockchain logging (Ethereum mainnet) — Module 3b only, aggregate stats
+**Status: Solidity sketches only.** Re-specified here; the old sketches
+(`contracts/`) are superseded.
 
-**Deliverables:**
-- CLI: `warren privacy policy set`
-- Active-probing resistance test harness (isolated DPI simulator, validates against real
-  active-probe behavior, not just passive signature-matching tools like nDPI)
-- Dashboard: Real-time censorship stats
+### 8.1 The core must work with settlement off
 
-**Tech Stack:** Go + Ethereum Goerli/Sepolia + libsnark + Circom/Groth16 (Module 3a)
+Reachability may not depend on a chain being live, a token having value, or a
+user holding one. Warren therefore defines an **accounting interface** with
+pluggable backends:
+
+| Backend | Use |
+|---------|-----|
+| `none` | Volunteer relays, altruistic pool. Fully functional. Default. |
+| `credits` | Signed off-chain receipts; redeemable, or never redeemed |
+| `onchain` | Optional adapter that settles net balances on a low-cost L2 |
+
+### 8.2 If on-chain, then L2-only and privately
+
+- **Never L1 mainnet for micro-settlement.** Post-EIP-4844 (Dencun, 2024) rollup
+  data costs made L2 settlement the only defensible choice; the original design's
+  "Ethereum mainnet" target is obsolete on cost grounds alone.
+- **Testnet names updated:** Goerli and Holesky are retired. Current targets are
+  **Sepolia** and **Hoodi**.
+- **Sponsored transactions are standard now.** ERC-4337 paymasters and EIP-7702
+  delegation (Pectra, 2025) provide sponsored/abstracted transactions off the
+  shelf. Warren's bespoke "bonded relayer pays gas" scheme (§14) is a
+  reimplementation of a solved problem and is dropped.
+- **No public listings.** Capacity offers are exchanged over the Warren control
+  plane and settled on-chain only as net balances between counterparties, never as
+  a browsable directory of residential relays (§7.2).
+- **Net settlement, hybrid trigger.** Off-chain signed receipts, with settlement
+  on the earlier of a volume or time threshold (starting point: 10 MB or 5 s of
+  open exposure, tuned against real receipt sizes). This part of the original
+  design was sound and is retained.
+
+### 8.3 Access rights without identity (revised)
+
+The original design authenticated relay access with a bespoke ZK "passport"
+circuit. The 2026 answer is an off-the-shelf standard: **Privacy Pass** (RFCs
+9576–9578, 2024) issues unlinkable, single-use tokens. A client redeems a token to
+open a session or to fetch a discovery subset; the relay learns *that* the client
+holds a valid entitlement, not which client, and cannot link two redemptions.
+
+This replaces the hand-rolled nullifier scheme for the authorization use case and
+covers the property that actually mattered — non-linkability across sessions —
+with an implemented, reviewed protocol. A ZK circuit remains justified only if
+Warren later needs attribute proofs (e.g. "holder of a real e-passport", for which
+ICAO-9303-based stacks now exist); in that case the library is **gnark** (Go
+native) or Noir/Halo2-class tooling, **not libsnark**, which has been unmaintained
+for years.
+
+### 8.4 Regulatory reality (new)
+
+- **EU:** MiCA has been fully applicable since 30 December 2024, and DAC8
+  reporting obligations begin in 2026. A freely transferable Warren token with a
+  public issuer is a regulated instrument, not a design detail.
+- **Consequence:** the `credits` backend is the default commercial path —
+  non-transferable, redeemable-for-service accounting. A transferable token, if it
+  ever exists, is a separate product decision with separate legal work, and the
+  protocol must not assume it.
 
 ---
 
-### Phase 3: Satellite Fallback + Integrations (Months 7–9)
+## 9. L4 — Private Measurement
 
-**Goals:**
-- [ ] Starlink/Kuiper API integration
-- [ ] LoRa mesh controller
-- [ ] Crovi VDI integration
-- [ ] Thump workload relocation sync
+**Status: not started.** This section replaces the Independence Logger's on-chain
+per-event design.
 
-**Deliverables:**
-- Auto-failover demo (primary → satellite)
-- Crovi plugin: auto-apply Warren privacy policies
+### 9.1 Why the old design is retired
+
+The original scheme wrote a ZK proof of "censorship evaded in region R at time T"
+to a public chain, via bonded relayers, to support NGO/research data
+subscriptions. Three problems:
+
+1. **It publishes a permanent, timestamped, region-tagged record of circumvention
+   activity.** Relayer indirection hides the wallet, not the event. In a small
+   region and a quiet hour, an event count *is* identifying, and immutability
+   means a future adversary inherits the whole archive.
+2. **It solves a solved problem worse.** Aggregate censorship measurement has
+   mature public infrastructure (OONI, IODA, Cloudflare Radar). Reinventing
+   collection adds no research value; contributing measurements does.
+3. **Its stack was dead.** libsnark is unmaintained; per-event ZK proof generation
+   for telemetry is enormous cost for a statistic.
+
+### 9.2 What replaces it
+
+- **Private aggregation, not published events.** Clients submit measurements
+  through a threshold-aggregation protocol (Prio/STAR-class, as deployed by ISRG's
+  Divvi Up and Cloudflare) where the collector learns only aggregates above a
+  k-anonymity threshold and never an individual report. Reports travel over
+  Oblivious HTTP (RFC 9458) so the collector does not learn submitter IPs.
+- **Opt-in, per-region, with an explicit k-threshold** below which a bucket is
+  simply never reported.
+- **Blocked vs. degraded as distinct signals** (§1.2), which is the measurement
+  the analytics product genuinely lacks today and can defensibly sell.
+- **Interoperate, don't duplicate:** publish in OONI-compatible form where
+  possible so Lumra's analytics and external researchers consume one schema.
+
+The revenue line survives: regional censorship analytics with a differentiated
+*degradation* signal, sold as aggregates. What's gone is the liability of an
+immutable public log of evasion events.
 
 ---
 
-### Phase 4: General Availability + Horizontal Expansion (Months 10–12+)
+## 10. Resilience Transports (Satellite / Mesh)
 
-**Goals:**
-- [ ] Production mainnet deployment
-- [ ] Warren DNS (domain name resolution over Warren network)
-- [ ] Warren Email (SMTP/IMAP over Warren)
-- [ ] Warren Storage (object storage over Warren)
+**Status: not started.** Re-specified as a **link type**, not an API integration.
+
+### 10.1 Corrections to the old design
+
+- **There is no consumer Starlink "establish tunnel" API.** The old pseudocode
+  (`StarlinkClient.EstablishTunnel(gateway)`) describes something that does not
+  exist. What a satellite link actually provides is an ordinary IP path with
+  distinctive latency, jitter, cost, and CGNAT behavior. Warren models it as a
+  link with attributes, and everything above L1 stays unchanged.
+- **Naming:** Amazon's Project Kuiper has been commercially branded **Amazon Leo**
+  since late 2025. Design text should name the service, not the codename.
+- **Direct-to-cell now exists** (e.g. T-Mobile's Starlink-backed T-Satellite,
+  commercial since 2025) and is a *messaging-class* link: excellent for control
+  plane, useless for data plane. It belongs on the ladder's lower rungs.
+- **Satellite terminals are a physical-risk vector, not a circumvention win.**
+  Possession is illegal in several censored jurisdictions, and a user terminal
+  emits a direction-findable signal. Recommending satellite as a censorship
+  workaround without saying this would endanger users; for most users under an
+  allowlist regime it is *more* dangerous than the network problem it solves.
+- **The old health formula was not a health score.**
+  `(1 - loss/100) * (1000/(latency+1)) * (bandwidth/100)` is unbounded and
+  compared against `0.6`, which is meaningless. Health is re-specified as
+  normalized, weighted goodput/completion/latency-percentile terms in [0, 1],
+  with hysteresis so a failover doesn't oscillate.
+- **LoRa capacity was overstated by 1–2 orders of magnitude.** The old claim of
+  "~500 control messages/second" is impossible: at an optimistic 50 kbit/s, a
+  100-byte message is 800 bits, giving ~60/s *theoretically*; at long-range
+  spreading factors the link is a few hundred bit/s, and EU sub-GHz duty-cycle
+  limits (commonly 1%) cap airtime at tens of seconds per hour. The realistic
+  budget is **single-digit messages per minute**, which changes the design: the
+  control plane must be built for store-and-forward with prioritized queues, not
+  periodic heartbeats.
+
+### 10.2 Revised model
+
+```
+Link types, each with {goodput, latency, jitter, cost/GB, legality risk, detectability}:
+  terrestrial-broadband | mobile | satellite-vsat | satellite-d2c | lora-mesh
+
+Policy picks a link per traffic class:
+  data-plane (VDI, bulk, browsing)  -> terrestrial | mobile | satellite-vsat
+  control-plane (heartbeat, DHT, checkpoint signals)
+                                    -> any, including satellite-d2c and lora-mesh
+  nothing                           -> lora-mesh gets data-plane traffic, ever
+```
+
+Strict tiering is retained and remains correct: routing VDI or workload migration
+over a kilobit mesh collapses the mesh. The enforcement mechanism is a policy-level
+drop on data-plane classes when the active link is mesh-grade, plus a user-visible
+"resilience mode (control only)" state.
+
+For the mesh itself, prefer the existing ecosystem (**Meshtastic**-class LoRa
+firmware and its addressing/routing) over a bespoke controller. Incentive payouts
+per relayed byte are dropped for mesh: with single-digit messages per minute there
+is no meaningful byte-volume market, and a payout scheme creates a spam incentive
+on the scarcest link in the system.
+
+---
+
+## 11. Cryptographic Inventory
+
+Every primitive, its status, and why. Hybrid PQ is the default for anything whose
+recording today could be decrypted later.
+
+| Purpose | Choice | Rationale |
+|---------|--------|-----------|
+| Session key exchange (Warren data plane) | **Hybrid X25519 + ML-KEM-768** | FIPS 203 standardized 2024; harvest-now-decrypt-later applies to long-lived recordings of circumvention traffic |
+| Camouflage handshake shape | uTLS profile whose `key_share` includes `X25519MLKEM768` | Must match what real browsers send *now* (§6.2) |
+| AEAD | ChaCha20-Poly1305 default; AES-256-GCM where hardware AES is present | ChaCha for CPU-only/mobile; AES-NI/ARMv8-crypto devices are faster with GCM |
+| Hash / KDF | SHA-256 (interop), BLAKE3 (bulk), HKDF-SHA256 | Unchanged, still correct |
+| Signatures (descriptors, releases) | Ed25519 now; **ML-DSA-65 hybrid planned** | FIPS 204; signature agility must exist before it is needed |
+| Access tokens | Privacy Pass (RFC 9576–9578) | Unlinkable entitlement without identity (§8.3) |
+| Telemetry aggregation | Prio/STAR-class threshold aggregation over OHTTP (RFC 9458) | Aggregates without individual reports (§9.2) |
+| ZK (only if attribute proofs are needed) | **gnark** (Go) or Noir/Halo2-class | libsnark is unmaintained and is removed from the stack |
+| RNG | OS CSPRNG (`getrandom`, `BCryptGenRandom`) | Unchanged |
+
+Retired from the earlier design: static PSK as the long-term authentication root
+(migration target is an audited REALITY implementation with ECDH-in-`key_share`),
+libsnark, and the Kyber draft groups superseded by ML-KEM.
+
+---
+
+## 12. Integration Layer (Crovi / Thump)
+
+Unchanged in intent, tightened in contract. Both integrations are **consumers of
+L1/L2**, and neither may become a required dependency of the transport.
+
+**Crovi (VDI).** On session start, Crovi hands Warren a policy-set identifier;
+Warren applies the corresponding local policy (shaping regime, path mode, exit
+constraints) to that desktop's traffic. Warren never receives the user's identity,
+and Crovi never receives path details that would let it correlate a user to a
+relay. VDI traffic is throughput-bound, so its default shaping regime is `off`
+with `bucket` available (§6.4) — the earlier "auto-apply cover traffic to VDI"
+assumption is removed as unaffordable.
+
+**Thump (infrastructure protection).** Thump signals workload relocation; Warren
+re-provisions the network path and reports the link class it landed on, so Thump
+can decide whether to proceed. In mesh-grade resilience mode Warren reports
+control-plane-only, and Thump holds migrations rather than attempting them over a
+kilobit link.
+
+---
+
+## 13. Security Model
+
+| Threat | Adversary | Mitigation | Status |
+|--------|-----------|-----------|--------|
+| Payload signature DPI | ISP, state | Camouflaged transport, real-site fallback (§6.1) | Implemented (PoC) |
+| Active probing | State probe infrastructure | Untagged connections receive a genuine response from the real fallback site | Implemented (PoC) |
+| Stale-parrot fingerprinting | State classifier | Current uTLS profile incl. hybrid PQ key share, CI staleness check (§6.2) | **Gap — action required** |
+| TLS state-machine mimicry after ClientHello | Censor replaying a full session | Migration to an audited REALITY implementation keeping the real handshake throughout | Gap (documented) |
+| Statistical flow classification | State classifier | Shaping regimes with stated cost (§6.4) | Not started |
+| IP/ASN blocklisting | Bulk range blocking | Residential pool scale + churn (§7.1) | Not started |
+| Relay pool enumeration | Censor harvesting the pool | No global list; rotating per-requester subsets; token-rate-limited discovery (§7.2) | Design changed, not started |
+| Discovery takedown | Blocking the bridge source | Multi-channel resolvers, signed lists, no central API (§5) | Implemented (signing: gap) |
+| Client distribution takedown | App-store removal orders | Reproducible builds, ≥3 non-app-store channels (§5.1) | Not started |
+| Throttling instead of blocking | State traffic management | Goodput-based health, degraded-vs-blocked signal (§7.3, §9) | Not started |
+| Sybil relays / malicious sellers | Profit-motivated or state-run nodes | Local-first reputation, collateral where settlement is on, path diversity | Not started |
+| Session linkability | Correlating observer | Privacy Pass unlinkable tokens (§8.3) | Design changed, not started |
+| Wallet-graph deanonymization | Chain analyst | Net-balance L2 settlement, sponsored transactions, no public listings (§8.2) | Design changed |
+| Evasion-log exposure | Future adversary reading an immutable ledger | On-chain per-event logging removed; threshold aggregation only (§9) | Design changed |
+| Exit-node abuse → operator liability | Criminal users; police; ISP | Relay≠exit default, declared exit policy, abuse handling, no identifying logs (§7.4) | **New requirement, not started** |
+| Mesh flooding | Attacker on LoRa | Control-plane-only classes, prioritized store-and-forward, no per-byte payouts (§10.2) | Design changed |
+| Harvest-now-decrypt-later | Well-resourced recorder | Hybrid X25519+ML-KEM-768 session handshake (§11) | Not started |
+| Slowloris on the sniff path | Cheap resource exhaustion | 5-second sniff deadline | Implemented |
+| Allowlist regime / shutdown | State, physical + policy layer | Degradation ladder rungs 5–7, stated honestly as partial (§6.5, §10) | Not started |
+
+### Privacy guarantees (as designed)
+
+1. **Data privacy.** No relay can read payloads; no Warren-operated component holds
+   plaintext.
+2. **Reachability privacy.** Camouflaged transport makes a Warren connection look
+   like a real visit to a real site, against passive DPI and active probes.
+3. **No identity requirement.** Access rights are unlinkable tokens; Warren never
+   needs a user identifier, so no component can be compelled to produce one.
+4. **Financial privacy.** Default accounting is off-chain and non-transferable;
+   on-chain settlement, if enabled, publishes net counterparty balances, not
+   sessions.
+5. **Measurement privacy.** Telemetry is opt-in, threshold-aggregated, and
+   IP-blinded; no per-event circumvention record is ever published.
+6. **Stated limits.** No metadata-correlation guarantee against an adversary who
+   sees both ends; no protection against a fingerprintable client; no defense
+   against physical shutdown.
+
+---
+
+## 14. Deprecated Decisions
+
+Recorded so the reasoning isn't re-litigated, and so anyone reading an older draft
+knows what changed.
+
+| Earlier decision | Status | Why |
+|------------------|--------|-----|
+| Naive SNI spoofing | Removed (already in the prior revision) | SNI-to-IP ownership correlation flags it instantly |
+| `HelloChrome_120` pinned profile | **Superseded** | No hybrid PQ key share; a 2023 parrot is a 2026 distinguisher (§6.2) |
+| TCP-only custom framing as the sole transport | Superseded | Single point of failure; MASQUE/WebSocket/WebRTC paths added (§6.3) |
+| Constant-rate cover traffic, always on | Superseded | Unbudgeted, and contradicts per-GB billing; replaced with three costed regimes (§6.4) |
+| On-chain per-event evasion logging | **Removed** | Publishes a permanent region-tagged record of circumvention; replaced by threshold aggregation (§9) |
+| Bespoke bonded-relayer gas payment | Removed | ERC-4337 / EIP-7702 solve sponsored transactions as a standard (§8.2) |
+| Ethereum mainnet for settlement; Goerli for test | Superseded | L2 settlement post-4844; Goerli/Holesky retired, use Sepolia/Hoodi (§8.2) |
+| Public on-chain bandwidth listings | **Removed** | A public, permanent directory of residential relays is a censor's blocklist (§7.2) |
+| libsnark for ZK | Removed | Unmaintained; gnark/Noir-class tooling if ZK is needed at all (§8.3, §11) |
+| Bespoke ZK-Passport nullifier for access control | Superseded | Privacy Pass provides unlinkable tokens as a published standard (§8.3) |
+| Static PSK as authentication root | Retained only as PoC | Migration target is an audited REALITY implementation with ECDH-in-`key_share` |
+| `Starlink.EstablishTunnel` API integration | Removed | No such consumer API; satellite is a link type (§10.1) |
+| "Amazon Kuiper" | Renamed | Commercially **Amazon Leo** since late 2025 |
+| "~500 LoRa control messages/second" | **Corrected** | Off by 1–2 orders of magnitude; duty cycle limits imply single-digit messages/minute (§10.1) |
+| Unbounded "health" formula compared to 0.6 | Corrected | Re-specified as normalized [0,1] with hysteresis (§10.1) |
+| Five node types | Simplified | Three roles: client / relay / exit — and relay≠exit is a safety property (§4, §7.4) |
+| Month-numbered roadmap | Replaced | Falsifiable gates (§16) |
+
+---
+
+## 15. Open Problems
+
+Honest list of things this design does not yet answer.
+
+1. **Fallback-site sourcing at scale.** Every relay needs a real, currently-popular
+   HTTPS site it can legitimately proxy to, per region, refreshed as sites change.
+   Who curates that list, how it is distributed without becoming enumerable, and
+   what happens when a borrowed site starts rejecting the relay, are unsolved.
+2. **Residential relay supply.** The structural defense assumes thousands of
+   households relay traffic. Given §7.4's liability discussion, the acquisition
+   story is unproven, and altruistic supply (Snowflake's model) may be the only
+   honest starting point — which changes the business model, not just the roadmap.
+3. **Sybil resistance without identity or a token.** Local-first reputation delays
+   the problem; it doesn't solve a state-funded adversary running 10,000 relays.
+4. **Shaping's real effectiveness.** Bucketing and cover traffic have published
+   partial results. Warren needs its own measurements against a current classifier
+   before claiming anything.
+5. **Rung 5 of the ladder** (carriage over allowlisted domestic endpoints) is the
+   most valuable and the most dangerous rung. It needs a per-region threat
+   assessment before any implementation.
+6. **Analytics product-market fit** for a "degradation" signal, now that the
+   on-chain evasion log is gone, is an assumption and not yet validated with the
+   NGO/research buyers the business plan names.
+
+---
+
+## 16. Roadmap
+
+Gated slices, ordered by "what makes everything above it moot if it fails".
+Each slice ships with its own falsifiable gate; no slice starts before its
+predecessor's gate is met.
+
+### Slice 1 — L1 hardening (in progress)
+
+- [x] Tagged ClientHello + real-site fallback splice, tested end-to-end
+- [x] Multi-channel bridge resolution with partial-failure reporting
+- [ ] Current camouflage profile with hybrid PQ key share; segmented-hello handling
+- [ ] CI staleness assertion on the active profile's key-share groups
+- [ ] Hybrid X25519+ML-KEM-768 for the Warren session handshake
+- [ ] Signed bridge descriptors (kill the unauthenticated-DNS steering risk)
+- [ ] Migration to an audited REALITY implementation, or a documented decision not to
+
+**Gate:** an isolated active-probe harness — a probe that connects, replays, and
+resumes against a Warren relay — cannot distinguish it from the borrowed site, and
+the client's ClientHello is not distinguishable by key-share/size/version features
+from the current profile of the browser it parrots.
+
+### Slice 2 — L1 breadth + L0 distribution
+
+- [ ] `masque` transport (RFC 9298/9484) and `websocket-tunnel`
+- [ ] Transport selection policy + degradation ladder rungs 1–4
+- [ ] Reproducible builds and ≥3 non-app-store distribution channels
+- [ ] Shaping regimes `bucket` / `cover` with measured overhead
+
+**Gate:** with UDP/443 blocked, with the primary transport blocked, and with the
+newest bridge list expired, a fresh client still reaches the network, and reports
+the rung it is on.
+
+### Slice 3 — L2 relay pool
+
+- [ ] Relay/exit role separation with exit policy enforcement
+- [ ] Abuse-handling documentation and per-exit contact metadata
+- [ ] Goodput-based health and local-first reputation
+- [ ] `mode=resilience` diversity-weighted selection; rotating discovery subsets
+- [ ] Privacy Pass token issuance/redemption for discovery and session admission
+
+**Gate:** a 20+ node testbed sustains usable interactive browsing while an
+adversary process that harvests discovery responses for 24 hours recovers less
+than a stated fraction of the pool.
+
+### Slice 4 — L3 accounting
+
+- [ ] `none` and `credits` backends (core works with settlement off)
+- [ ] Off-chain signed receipts, hybrid volume/time settlement trigger
+- [ ] Optional L2 `onchain` adapter (Sepolia/Hoodi first), net balances only
+- [ ] No public listing surface anywhere in the design
+
+**Gate:** relays are paid for a week of real traffic with zero on-chain
+transactions, and separately, net settlement reconciles on an L2 testnet with
+per-session data appearing nowhere on chain.
+
+### Slice 5 — L4 measurement
+
+- [ ] Threshold-aggregated telemetry over OHTTP, opt-in, k-anonymity floor
+- [ ] Blocked-vs-degraded classification
+- [ ] OONI-compatible publication path for Lumra and external researchers
+
+**Gate:** a regional report is produced where no bucket below the k-threshold is
+emitted and no individual report is recoverable by the collector.
+
+### Slice 6 — Resilience + ecosystem
+
+- [ ] Link-type abstraction with per-class policy (satellite / mobile / mesh)
+- [ ] Mesh control-plane store-and-forward on a Meshtastic-class stack
+- [ ] Crovi policy injection; Thump link-class reporting and migration holds
+- [ ] Degradation ladder rungs 6–7
+
+**Gate:** a live demo where the terrestrial link is severed, data plane stops,
+control plane keeps flowing over a mesh link within its real duty-cycle budget,
+and Thump correctly holds a migration instead of attempting it.
+
+### Later — horizontal expansion
+
+Warren DNS, Warren Email, Warren Storage. Not scoped until Slice 3's gate is met;
+a name service over an unproven transport is a demo, not a product.
 
 ---
 
 ## References
 
-- [libp2p specification](https://libp2p.io/spec/)
-- [Ethereum Yellow Paper](https://ethereum.org/en/developers/docs/)
-- [ChaCha20-Poly1305 RFC 8439](https://tools.ietf.org/html/rfc8439)
-- [Zero-Knowledge Proof primer](https://en.wikipedia.org/wiki/Zero-knowledge_proof)
+**Standards**
+- TLS 1.3 — RFC 8446; ChaCha20-Poly1305 — RFC 8439
+- ML-KEM — FIPS 203; ML-DSA — FIPS 204; SLH-DSA — FIPS 205; PQC transition — NIST IR 8547 (draft)
+- MASQUE — RFC 9298 (CONNECT-UDP), RFC 9484 (CONNECT-IP)
+- Oblivious HTTP — RFC 9458; Privacy Pass — RFC 9576–9578
+- QUIC — RFC 9000; HTTP/3 — RFC 9114
+
+**Prior art Warren composes**
+- REALITY (xtls/xray-core) — probe-resistant TLS borrowing
+- uTLS — browser ClientHello fingerprint parroting
+- Snowflake, Psiphon, Tor WebTunnel, Conjure/refraction networking — pool-scale and fronted transports
+- Prio / STAR / Divvi Up — threshold aggregation for private telemetry
+- OONI, IODA, Cloudflare Radar — censorship measurement infrastructure
+- Meshtastic — LoRa mesh firmware and routing
+
+**Internal**
+- `docs/protocol/reality-transport.md` — L0/L1 implementation notes and known gaps
+- `docs/ROADMAP.md` — public-facing slice status

@@ -22,8 +22,14 @@ thing that needed to be provable, not just specified.
 
 A Warren client's first packet on the wire is a syntactically valid TLS 1.3
 ClientHello, built with [uTLS](https://github.com/refraction-networking/utls)
-so its extension order, cipher list, and ALPN match a real Chrome 120
-fingerprint. A 16-byte authentication tag — `HMAC-SHA256(psk, client_random)`
+so its extension order, cipher list, key shares, and ALPN match a current
+Chrome fingerprint (`transport.DefaultFingerprint`, tracking
+`utls.HelloChrome_Auto`). That profile is a perishable value, not a constant:
+mainstream browsers now offer the hybrid post-quantum group
+`X25519MLKEM768` by default, so a parrot of a pre-PQ browser is a
+distinguisher rather than a disguise — smaller than real hellos and missing a
+key share real hellos carry. `Config.Fingerprint` overrides it per bridge or
+per region, since the right parrot is whatever the local population runs. A 16-byte authentication tag — `HMAC-SHA256(psk, client_random)`
 — is embedded in the ClientHello's `session_id` field (padded to the usual
 32 bytes so the field length itself isn't a tell).
 
@@ -115,6 +121,14 @@ get blocked one at a time rather than failing outright.
   Real TLS ClientHellos are always well over this size, so real HTTPS
   traffic isn't affected — but naive test clients (or an unusually terse
   probe) will see the full delay.
+- **Segmented ClientHello not yet exercised in tests.** The current profile's
+  hello is ~1.5 KB (see `TestClientHelloSpansMultipleSegments`), which does not
+  arrive in a single TCP segment on a real network. The tag sits at a fixed
+  offset inside the first record, so extraction is unaffected in principle, and
+  the server discards the whole record by its length field — but the tests
+  exercise a loopback socket, not realistic segmentation, and the 5-second
+  sniff deadline has not been validated against a slow, fragmented arrival of a
+  legitimate hello.
 - **No cover traffic / packet-size normalization yet.** DESIGN.md's
   "fixed-bucket sizing + constant-rate cover traffic" ML-classifier defense
   isn't implemented at this layer — this PoC proves the tag+fallback
@@ -149,7 +163,10 @@ against hitting port 9443 directly.
 go test ./internal/network/transport/... ./internal/discovery/bootstrap/... -race
 ```
 
-Covers: genuine-client round trip over AEAD framing, untagged/malformed
+Covers: the camouflage profile actually offering a hybrid post-quantum key
+share (a staleness guard — it fails the moment `DefaultFingerprint` regresses
+to a pre-PQ profile) and the resulting hello size, genuine-client round trip
+over AEAD framing, untagged/malformed
 input falling through to the real fallback (not reaching the Warren
 handler), bridge-file parsing (including skipping malformed lines rather
 than failing the whole file), and `Multi` surviving partial discovery-channel

@@ -2,8 +2,9 @@
 //
 // This is a "REALITY-lite" scheme: a Warren client's first packet is a
 // syntactically valid TLS 1.3 ClientHello (built with uTLS so it carries a
-// real browser's JA3 fingerprint) addressed to a real, currently-reachable
-// HTTPS site. A 16-byte authentication tag is embedded in the ClientHello's
+// current browser's fingerprint, including the hybrid post-quantum key share
+// mainstream browsers now offer by default) addressed to a real,
+// currently-reachable HTTPS site. A 16-byte authentication tag is embedded in the ClientHello's
 // session_id field, derived from a pre-shared key (PSK) and the ClientHello's
 // own random field.
 //
@@ -70,7 +71,25 @@ type Config struct {
 
 	// FallbackAddr is host:port for FallbackSNI (server-side only).
 	FallbackAddr string
+
+	// Fingerprint selects which browser ClientHello uTLS parrots. Zero value
+	// means DefaultFingerprint.
+	//
+	// This is a perishable value, not a constant: browsers now offer a hybrid
+	// post-quantum key share (X25519MLKEM768) by default, which makes a real
+	// 2026 ClientHello both larger and structurally different from a 2023 one.
+	// Parroting a profile that predates that shift is itself a distinguisher,
+	// so the pinned profile has to keep moving. Per-region overrides matter too
+	// — the right parrot is whatever the local population actually runs.
+	Fingerprint utls.ClientHelloID
 }
+
+// DefaultFingerprint is the profile used when Config.Fingerprint is unset.
+// HelloChrome_Auto tracks the newest Chrome profile uTLS ships, which is what
+// keeps the hello's size and key_share groups inside the distribution of real
+// browser traffic. TestDefaultFingerprintOffersHybridPQKeyShare guards the
+// property that actually matters if this is ever pinned to a fixed version.
+var DefaultFingerprint = utls.HelloChrome_Auto
 
 func deriveTag(psk, clientRandom []byte) []byte {
 	mac := hmac.New(sha256.New, psk)
@@ -146,7 +165,12 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 		return nil, fmt.Errorf("transport: dial %s: %w", addr, err)
 	}
 
-	uconn := utls.UClient(raw, &utls.Config{ServerName: cfg.FallbackSNI}, utls.HelloChrome_120)
+	fingerprint := cfg.Fingerprint
+	if fingerprint.Client == "" {
+		fingerprint = DefaultFingerprint
+	}
+
+	uconn := utls.UClient(raw, &utls.Config{ServerName: cfg.FallbackSNI}, fingerprint)
 	if err := uconn.BuildHandshakeState(); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("transport: build client hello: %w", err)
@@ -168,8 +192,9 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 	// re-encode from the struct fields by default. Since we just mutated
 	// SessionId, the cache is stale; clearing Raw forces Marshal to
 	// actually re-serialize, picking up our patched SessionId while
-	// everything else (extension order, cipher list, ALPN — the JA3
-	// fingerprint) still matches what uTLS built for Chrome 120.
+	// everything else (extension order, cipher list, key shares, ALPN — the
+	// fingerprint proper) still matches what uTLS built for the parroted
+	// browser profile.
 	hello.Raw = nil
 	rawHello, err := hello.Marshal()
 	if err != nil {

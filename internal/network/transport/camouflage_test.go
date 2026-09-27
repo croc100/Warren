@@ -7,6 +7,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 func startFallbackEcho(t *testing.T) string {
@@ -140,4 +142,44 @@ func TestUntaggedClient_FallsBackToRealSite(t *testing.T) {
 		t.Fatal("Warren handler was reached by an untagged connection")
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// TestDefaultFingerprintOffersHybridPQKeyShare is a staleness guard, not a
+// crypto test. Mainstream browsers offer X25519MLKEM768 by default, so a
+// parroted ClientHello that only offers classical groups is anomalous against
+// the real traffic distribution it's hiding in — the disguise rots quietly as
+// the pinned profile ages. This fails as soon as DefaultFingerprint is moved
+// back to a pre-PQ profile.
+func TestDefaultFingerprintOffersHybridPQKeyShare(t *testing.T) {
+	uconn := utls.UClient(nil, &utls.Config{ServerName: "example.com"}, DefaultFingerprint)
+	if err := uconn.BuildHandshakeState(); err != nil {
+		t.Fatalf("build handshake state: %v", err)
+	}
+
+	for _, ks := range uconn.HandshakeState.Hello.KeyShares {
+		if ks.Group == utls.X25519MLKEM768 {
+			return
+		}
+	}
+	t.Fatalf("default fingerprint %+v offers no hybrid post-quantum key share; real browsers do", DefaultFingerprint)
+}
+
+// TestClientHelloSpansMultipleSegments records the size shift a hybrid PQ key
+// share causes: the hello no longer fits the single small segment the rest of
+// these tests exercise, so the server's record-boundary handling has to cope
+// with a hello that arrives in pieces.
+func TestClientHelloSpansMultipleSegments(t *testing.T) {
+	uconn := utls.UClient(nil, &utls.Config{ServerName: "example.com"}, DefaultFingerprint)
+	if err := uconn.BuildHandshakeState(); err != nil {
+		t.Fatalf("build handshake state: %v", err)
+	}
+	uconn.HandshakeState.Hello.Raw = nil
+	raw, err := uconn.HandshakeState.Hello.Marshal()
+	if err != nil {
+		t.Fatalf("marshal client hello: %v", err)
+	}
+	if len(raw) < 1000 {
+		t.Fatalf("client hello is %d bytes, expected a post-quantum-sized hello (>1000); profile may have regressed", len(raw))
+	}
+	t.Logf("default profile client hello: %d bytes", len(raw))
 }

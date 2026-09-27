@@ -1,107 +1,164 @@
 # Warren Roadmap
 
-**The decentralized internet layer for Crovi, Thump, and beyond.**
+**A censorship-resistant network transport for the CRODE line (Crovi, Thump, Lumra).**
 
-This document is the source of truth for Warren's public roadmap. Detailed
-architecture and rationale for each item live in [`DESIGN.md`](../DESIGN.md);
-this file tracks *what* ships *when* and in what order.
+This file tracks *what ships in what order*. Architecture and rationale live in
+[`DESIGN.md`](../DESIGN.md).
 
 Status legend: ✅ done · 🚧 in progress · ⬜ planned
 
----
-
-## Milestones at a Glance
-
-| Phase | Timeline | Theme | Gate to next phase |
-|-------|----------|-------|--------------------|
-| **Alpha** | Months 1–3 | ISP Marketplace MVP on testnet | 5–10 node testnet trades settle end-to-end |
-| **Beta** | Months 4–6 | Privacy Gateway + Independence Logger | Passes active-probing resistance harness |
-| **RC** | Months 7–9 | Satellite Fallback + CRODE integrations | Live primary→satellite failover demo |
-| **GA** | Months 10–12 | Mainnet + hardening | Production mainnet with paying nodes |
-| **Expansion** | Year 2+ | Warren DNS / Email / Storage | — |
-
-Timelines are relative to project start, not calendar-locked. Phases gate on the
-"gate to next phase" criterion, not the month count.
+> **Read this first.** Warren is pre-alpha. Two layers exist (bootstrap discovery
+> and a camouflaged transport proof of concept, ~1,100 lines of Go); everything
+> else is specification. See [`DESIGN.md` §0](../DESIGN.md#0-implementation-status).
 
 ---
 
-## Phase 1 — Alpha: ISP Marketplace MVP (Months 1–3)
+## Why there are no dates
 
-Prove the core economic loop: a node can sell spare bandwidth and a buyer can
-route through it with settlement on chain.
+The previous version of this file promised a marketplace MVP in "Months 1–3" and
+mainnet in "Months 10–12". Those numbers were not derived from anything, and they
+ordered the work backwards: the bandwidth market was scheduled before the
+transport it would sell access to was known to survive a censor.
 
-- ⬜ Warren Core Protocol — P2P mesh + DHT (libp2p)
-- ⬜ Bandwidth-trading smart contract (Ethereum testnet, Sepolia)
-- ⬜ Marketplace node implementation (list / buy / settle)
-- ⬜ Encrypted tunnel creation (ChaCha20-Poly1305)
-- ⬜ Basic reputation system
-
-**Deliverables**
-- CLI: `warren marketplace list`, `warren marketplace buy`
-- Local testnet with 5–10 nodes settling trades
-- Getting-started documentation
-
-**Stack:** Go · Solidity · libp2p
+Slices are now ordered by *what makes everything above it moot if it fails*, and
+each one ships with a falsifiable gate. A slice is done when its gate passes, not
+when a month ends.
 
 ---
 
-## Phase 2 — Beta: Privacy Gateway + Independence Logger (Months 4–6)
+## Slices at a glance
 
-Make traffic uncensorable and prove it, without exposing users.
-
-- ⬜ Privacy-first routing protocol (DPN), intent-based
-- ⬜ YAML policy engine (policies stay local, never leave device)
-- ⬜ REALITY-style TLS borrowing — protocol camouflage (Module 2)
-- ⬜ Decentralized bootstrap/discovery — multi-channel, no single broker
-- ⬜ ZK-Passport local handshake auth with session nullifiers (Module 3a)
-- ⬜ Independence Logger — aggregate ZKP generation (Module 3b)
-- ⬜ On-chain aggregate stats logging (Ethereum mainnet, Module 3b only)
-
-**Deliverables**
-- CLI: `warren privacy policy set`
-- Active-probing resistance harness — isolated DPI simulator validating against
-  real active-probe behavior, not just passive signature tools (nDPI)
-- Dashboard: real-time censorship statistics
-
-**Stack:** Go · Ethereum Sepolia · libsnark · Circom/Groth16 (Module 3a)
+| # | Slice | Gate | Status |
+|---|-------|------|--------|
+| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | 🚧 |
+| 2 | L1 breadth + L0 distribution | Fresh client still connects with UDP/443 blocked, primary transport blocked, and bridge list expired | ⬜ |
+| 3 | L2 relay pool | 20+ node testbed usable for interactive browsing while a 24h discovery-harvesting adversary recovers < stated fraction of the pool | ⬜ |
+| 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |
+| 5 | L4 measurement | Regional report emits no sub-threshold bucket and no recoverable individual report | ⬜ |
+| 6 | Resilience + ecosystem | Link severed → data plane stops, control plane flows over mesh within real duty-cycle budget, Thump holds migration | ⬜ |
 
 ---
 
-## Phase 3 — RC: Satellite Fallback + CRODE Integrations (Months 7–9)
+## Slice 1 — L1 transport hardening 🚧
 
-Survive infrastructure collapse and plug into the rest of CRODE.
+The layer everything else depends on. If a connection can be detected or probed,
+no amount of marketplace or analytics matters.
 
-- ⬜ Starlink / Kuiper API integration
-- ⬜ LoRa mesh controller + incentive model
-- ⬜ Crovi VDI integration — auto-apply Warren privacy policies
-- ⬜ Thump workload-relocation network sync
+- ✅ Tagged TLS ClientHello + byte-for-byte fallback splice to a real site
+  (`internal/network/transport`), verified end-to-end against a real HTTP server
+- ✅ Multi-channel bridge resolution with per-channel failure reporting
+  (`internal/discovery/bootstrap`)
+- ✅ Camouflage profile tracks a current browser (hybrid post-quantum key share),
+  with a CI staleness guard on the profile's key-share groups
+- ⬜ Segmented-ClientHello handling validated (a PQ hello is ~1.5 KB and does not
+  arrive in one segment; the old tests only exercised a small 2023-shaped hello)
+- ⬜ Hybrid X25519 + ML-KEM-768 for the Warren session handshake itself
+- ⬜ Signed bridge descriptors (removes unauthenticated-DNS steering)
+- ⬜ Migrate to an audited REALITY implementation, or record the decision not to
 
-**Deliverables**
-- Auto-failover demo (primary → satellite)
-- Crovi plugin: transparent per-desktop privacy policies
-
----
-
-## Phase 4 — GA + Horizontal Expansion (Months 10–12+)
-
-- ⬜ Production mainnet deployment + hardening
-- ⬜ Warren DNS — name resolution over the Warren network
-- ⬜ Warren Email — SMTP/IMAP over Warren
-- ⬜ Warren Storage — object storage over Warren
-
----
-
-## Non-Goals
-
-Warren is a network layer, not an application suite. See
-[`DESIGN.md` § Scope & Non-Goals](../DESIGN.md) for the full list — notably it is
-not a coin, not a general-purpose blockchain, and does not custody user funds
-beyond the bandwidth-settlement contract.
+**Gate:** an isolated active-probe harness — connect, replay, resume — cannot
+distinguish a Warren relay from the borrowed site, and the client's hello is not
+separable by key-share, size, or version features from the profile it parrots.
+A passive signature tool (nDPI-class) is not sufficient evidence.
 
 ---
 
-## Ecosystem Alignment
+## Slice 2 — L1 breadth + client distribution ⬜
+
+One transport and two app stores are both single points of failure.
+
+- ⬜ `masque` transport (RFC 9298 CONNECT-UDP / RFC 9484 CONNECT-IP)
+- ⬜ `websocket-tunnel` transport (Tor WebTunnel pattern, behind a fronted site)
+- ⬜ Transport selection policy + degradation ladder rungs 1–4
+- ⬜ Reproducible builds, signed artifacts, ≥3 non-app-store distribution channels
+- ⬜ Shaping regimes `bucket` and `cover`, each with measured overhead published
+
+**Gate:** with UDP/443 blocked, the primary transport blocked, and the newest
+signed bridge list expired, a fresh install still reaches the network and reports
+which rung of the ladder it is on.
+
+---
+
+## Slice 3 — L2 relay pool ⬜
+
+The structural anti-blocklisting bet: many ordinary residential endpoints,
+churning, non-enumerable.
+
+- ⬜ Relay / exit role separation — a default install is **relay only**
+- ⬜ Declared, locally enforced exit policy + abuse-handling documentation
+- ⬜ Goodput- and completion-based health (throttling detection, not just reachability)
+- ⬜ Local-first reputation; `mode=resilience` diversity-weighted path selection
+- ⬜ Rotating per-requester discovery subsets, rate-limited by Privacy Pass tokens
+
+**Gate:** a 20+ node testbed sustains usable interactive browsing while an
+adversary process harvesting discovery responses for 24 hours recovers less than a
+pre-stated fraction of the pool.
+
+---
+
+## Slice 4 — L3 accounting ⬜
+
+Reachability must never depend on a chain being live or a token having value.
+
+- ⬜ `none` backend (volunteer pool, fully functional) and `credits` backend
+- ⬜ Off-chain signed receipts, settlement on 10 MB or 5 s, whichever first
+- ⬜ Optional L2 `onchain` adapter (Sepolia/Hoodi first), net balances only
+- ⬜ No public listing surface — capacity offers never become a browsable directory
+
+**Gate:** relays are paid for a week of real traffic with zero on-chain
+transactions; separately, net settlement reconciles on an L2 testnet with
+per-session data appearing nowhere on chain.
+
+---
+
+## Slice 5 — L4 private measurement ⬜
+
+Replaces the on-chain Independence Logger, which is retired
+([why](../DESIGN.md#91-why-the-old-design-is-retired)).
+
+- ⬜ Threshold-aggregated telemetry (Prio/STAR-class) over Oblivious HTTP
+- ⬜ Opt-in, per-region, with a k-anonymity floor below which nothing is emitted
+- ⬜ Blocked-vs-degraded classification — the signal the analytics market lacks
+- ⬜ OONI-compatible publication path for Lumra and external researchers
+
+**Gate:** a regional report is produced in which no sub-threshold bucket is
+emitted and no individual report is recoverable by the collector.
+
+---
+
+## Slice 6 — Resilience transports + ecosystem ⬜
+
+- ⬜ Link-type abstraction (terrestrial / mobile / satellite VSAT / direct-to-cell / mesh)
+  with per-traffic-class policy
+- ⬜ Mesh control-plane store-and-forward on a Meshtastic-class stack, inside real
+  duty-cycle limits (single-digit messages per minute, not the 500/s an earlier
+  draft claimed)
+- ⬜ Crovi policy injection; Thump link-class reporting and migration holds
+- ⬜ Degradation ladder rungs 6–7 (mesh-only, then offline cache)
+
+**Gate:** live demo — terrestrial link severed, data plane stops, control plane
+keeps flowing over mesh within its duty-cycle budget, and Thump holds a migration
+instead of attempting it over a kilobit link.
+
+---
+
+## Later — horizontal expansion
+
+Warren DNS, Warren Email, Warren Storage. Not scoped until Slice 3's gate passes;
+a name service over an unproven transport is a demo, not a product.
+
+---
+
+## Non-goals
+
+Warren is a network transport, not an application suite, not an anonymity network,
+and not a coin. The core must work with settlement disabled. See
+[`DESIGN.md` §2](../DESIGN.md#2-scope--non-goals).
+
+---
+
+## Ecosystem alignment
 
 Warren is the network substrate for the CRODE no-log line — Crovi (secure VDI),
 Thump (infrastructure protection), and Lumra (censorship-interference analysis).
-Lumra's analytics consume the Independence Logger's aggregate, opt-in statistics.
+Lumra consumes Slice 5's opt-in aggregate measurements.
