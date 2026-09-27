@@ -2,6 +2,51 @@
 
 All notable changes to Warren. Newest first.
 
+## 2026-09-28 — L0: signed, expiring bridge descriptors
+
+Second Slice 1 item. Bridges no longer travel as bare `addr|sni|pubkey` lines
+over channels a censor can influence.
+
+### Added
+
+- `internal/discovery/bootstrap/descriptor.go`: the `warren-bridges/1`
+  descriptor — one line, whitespace-free, so any text channel can carry it (DNS
+  TXT record, chat message, QR code, printed page):
+  `warren-bridges/1;issued=…;expires=…;bridge=addr|sni|pubkey[;bridge=…];sig=…`
+  with an Ed25519 signature over the literal wire prefix, not a
+  re-serialization of parsed fields. Unknown fields are rejected; the version
+  prefix is how a future format announces itself.
+- `cmd/bootstrap`: `-genkey` (mint the trust anchor; the anchor ships with
+  clients, the signing key stays offline), `-sign`, `-verify`. It replaces the
+  "not yet implemented" placeholder.
+- Staleness as a first-class state: `Descriptor.Stale`, `Bridge.Stale`,
+  `Bridge.Expires`, `Result.Stale`. `Multi` prefers a fresh copy of a relay over
+  a stale one and sorts fresh bridges first; `cmd/cli` warns when it is dialing
+  a stale bridge.
+- Tests: sign/verify round trip, a byte-by-byte tamper sweep over the whole
+  signed payload, a descriptor signed by a different key, missing anchor,
+  unknown field, expiry surfacing as stale rather than fatal, a tampered DNS
+  record costing only itself, and `Multi` refusing to let a stale descriptor
+  override a current one.
+
+### Changed
+
+- `FileResolver` and `DNSResolver` now require `Anchors` and **fail closed**
+  without one. A file and a DNS answer are the two cheapest places for a censor
+  to put its own bridge list, so "no anchor configured" is an error rather than a
+  silent downgrade to trusting the channel. `StaticResolver` still needs no
+  signature: its bridges arrived inside the client binary.
+- `cmd/cli` takes `-trust-anchor` / `WARREN_BRIDGE_ANCHOR_HEX` when reading a
+  bridge file. Explicit `-addr`/`-relay-key` still works for local demos, where
+  the operator is the trust anchor.
+
+### Why expiry is not fatal
+
+A verified but expired descriptor still yields bridges, marked stale. Treating
+expiry as fatal would hand a censor a way to strand clients by blocking every
+discovery channel for a week — the addresses a client already holds may well
+still work, and "discovery is stale" is a different state from "no bridges".
+
 ## 2026-09-28 — L1: hybrid post-quantum session handshake, static PSK removed
 
 Slice 1 work from [`docs/ROADMAP.md`](ROADMAP.md). The transport no longer has a

@@ -100,7 +100,38 @@ a repeat exactly like an unauthenticated connection: spliced to the real site.
 Without this, a censor could confirm a suspected relay by replaying one
 recorded hello and noticing the response differs from the real site's.
 
-## L0: multi-channel discovery
+## L0: signed descriptors over multiple channels
+
+Bridges travel as **signed, expiring descriptors**, one per line, so any channel
+that carries text can carry them — a DNS TXT record, a chat message, a QR code,
+a printed page:
+
+```
+warren-bridges/1;issued=<RFC3339>;expires=<RFC3339>;bridge=<addr|sni|pubkey>[;bridge=...];sig=<base64url>
+```
+
+The Ed25519 signature covers the literal prefix of the line up to and including
+the `;` before `sig=` — the exact bytes on the wire, never a re-serialization of
+parsed fields, because verifying a re-encoding is a well-worn way to ship a
+signature bypass: any field the parser ignores or normalizes becomes a place to
+hide content the signature does not cover. Unknown fields are rejected outright;
+the version prefix is how a future format announces itself.
+
+This is what reduces a hostile discovery channel from an attack to a denial of
+service. A censor who controls a DNS answer or circulates its own "bridge list"
+cannot produce a descriptor that verifies, so it cannot steer a client onto a
+relay of its choosing — and since the relay's identity key is inside the signed
+payload, it cannot swap that either. `TestVerifyRejectsTamperedFields` flips
+every byte of the payload in turn and asserts that none of them survives.
+
+**Expiry is a reported state, not a fatal error.** A verified but expired
+descriptor still yields bridges, marked `Stale`, and `Multi` prefers fresh
+copies and reports which channels are serving only stale data. Treating expiry
+as fatal would hand a censor a way to strand clients by blocking every discovery
+channel for a week; the addresses a client already holds may well still work.
+
+`bootstrap -genkey` mints the anchor (public half ships with clients, signing key
+stays offline), `-sign` produces a descriptor, `-verify` inspects one.
 
 `Multi` queries every configured `Resolver` concurrently and merges whatever
 succeeds, rather than stopping at the first one that answers. Three resolver
@@ -111,20 +142,28 @@ types are implemented:
   instances at different upstream resolvers (the same "don't depend on one
   operator" logic that makes multi-resolver DNS robust against a single censored
   resolver).
-- `FileResolver` — reads a local bridge list, one `addr|sni|pubkey` per line.
-  This is the landing point for out-of-band bridge distribution (encrypted
-  messaging, email autoresponder — the same pattern Tor bridges use); the
-  distribution mechanism itself is out of scope for this package.
+- `FileResolver` — reads signed descriptors from a local file, one per line. This
+  is the landing point for out-of-band bridge distribution (encrypted messaging,
+  email autoresponder — the same pattern Tor bridges use); the distribution
+  mechanism itself is out of scope for this package.
 - `StaticResolver` — a fixed, compiled-in list. Last resort only: it can't be
-  taken down, but also can't be updated without a new build.
+  taken down, but also can't be updated without a new build. It is the one
+  resolver that needs no signature, because its bridges arrived inside the
+  client binary and already carry whatever assurance the release artifact has.
+
+`FileResolver` and `DNSResolver` both **fail closed without a trust anchor**: a
+file and a DNS answer are the two cheapest places for a censor to put its own
+list, so "no anchor configured" is an error rather than a silent downgrade to
+trusting the channel.
 
 `Multi.Resolve` returns success as long as *any* channel works, plus a
 per-channel report — so an operator can see which discovery channels are
-currently blocked in a given region, and a client keeps working as channels get
-blocked one at a time rather than failing outright. A descriptor missing its
-relay public key is skipped as malformed rather than accepted: a bridge without
-an identity key is unusable, and accepting it would push the failure to dial
-time, where it looks like censorship instead of a bad descriptor.
+currently blocked (or being tampered with, or serving stale data) in a given
+region, and a client keeps working as channels get blocked one at a time rather
+than failing outright. A bridge missing its relay public key is rejected as
+malformed: a bridge without an identity key is unusable, and accepting it would
+push the failure to dial time, where it looks like censorship instead of a bad
+descriptor.
 
 ## Known gaps vs. a hardened production transport
 
@@ -143,11 +182,14 @@ time, where it looks like censorship instead of a bad descriptor.
 - **Traffic shape is unmodified.** DESIGN.md's `bucket`/`cover` regimes
   (§6.4) aren't implemented; record sizes track payload sizes, so a flow
   classifier still sees Warren's own size and timing distribution.
-- **Bridge descriptors are unsigned.** The relay public key means a hostile
-  discovery channel can no longer silently steer a client onto a censor-run
-  relay *that the client will talk to* — the tag simply won't validate — but a
-  channel can still hand out addresses that waste a client's time. Signed,
-  expiring descriptors are the next L0 item.
+- **Distribution of the anchor and of the client itself is unsolved.** Signed
+  descriptors move the problem one step back: the anchor ships with the client,
+  so the remaining question is how the client gets to the user in a region where
+  app stores remove it on request. Reproducible builds and several non-app-store
+  channels are the next L0 items (DESIGN.md §5.1).
+- **No rotating per-requester subsets.** Discovery currently hands out whatever
+  a channel holds; anti-enumeration (rotating subsets, token-rate-limited
+  requests) is L2 work (DESIGN.md §7.2).
 - **Sniff latency on short, non-ClientHello-shaped input.** A connection whose
   record header claims more bytes than it ever sends waits out the 5-second
   sniff deadline before falling through. Real HTTPS clients are unaffected;
@@ -167,14 +209,21 @@ python3 -m http.server 9443
 go run ./cmd/node -listen=127.0.0.1:8443 \
   -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 
-# 4. a bridge descriptor, as an out-of-band channel would distribute it
-echo "127.0.0.1:8443|www.example.com|<relay public key hex>" > bridges.txt
+# 4. the bridge-distribution trust anchor (signing key stays offline)
+eval "$(go run ./cmd/bootstrap -genkey 2>/dev/null)"
 
-# 5. the client
+# 5. a signed descriptor, as an out-of-band channel would distribute it
+go run ./cmd/bootstrap -sign -ttl=168h \
+  -bridge="127.0.0.1:8443|www.example.com|<relay public key hex>" > bridges.txt
+go run ./cmd/bootstrap -verify -file=bridges.txt
+
+# 6. the client
 go run ./cmd/cli -bridge-file=bridges.txt -message="hello from behind the firewall"
 ```
 
-A genuine Warren client gets its message echoed back over the AEAD channel.
+A genuine Warren client gets its message echoed back over the AEAD channel. Edit
+one byte of `bridges.txt` — swap the relay key, as a hostile channel would — and
+the client refuses it before dialing anything.
 Then act like a censor's probe: `curl -v --http1.0 http://127.0.0.1:8443/`
 returns a real response from whatever is on `-fallback-addr`. A client holding
 the wrong relay key gets the same treatment as the probe — it is spliced to the
@@ -191,7 +240,9 @@ Covers: the full hybrid handshake round trip; untagged input spliced to the real
 site without reaching the Warren handler; a client holding the **wrong relay
 key** treated as a probe; a **replayed ClientHello** spliced to the real site;
 a **segmented ClientHello** (delivered in 137-byte chunks through a fragmenting
-proxy) still authenticating, which is the realistic arrival pattern for a
+proxy) still authenticating; descriptor signing and verification, including a
+byte-by-byte tamper sweep, an unknown-field rejection, a hostile signer, and
+expiry surfacing as stale rather than fatal; which is the realistic arrival pattern for a
 ~1.5 KB hybrid hello; the client's on-wire **record-type sequence** matching a
 real TLS 1.3 client; **per-connection ephemerality** of every secret, including
 a relay with a different identity key failing the tag check; and the camouflage

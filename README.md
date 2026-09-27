@@ -21,7 +21,8 @@ state-scale adversary.**
 | Exit IPs get blocklisted within days | Relay pool of ordinary residential nodes, churning, non-enumerable — blocking cost scales with households, not with VPN companies |
 | DPI signature matching and active probing | Camouflaged transport: an unauthenticated connection gets a genuine response from a real site, because a real site actually answered it |
 | Statistical flow classification | Current browser fingerprint (incl. hybrid post-quantum key share), TLS-shaped records + costed traffic-shaping regimes |
-| Discovery endpoints get blocked | Multi-channel bootstrap (DoH/DNS TXT, out-of-band bridge lists, compiled-in fallback), no central bridge API |
+| Discovery endpoints get blocked | Multi-channel bootstrap (DNS TXT, out-of-band bridge lists, compiled-in fallback), no central bridge API |
+| A discovery channel turns hostile | Signed, expiring descriptors covering each relay's identity key — a tampered list is rejected before anything is dialed |
 | Traffic recorded now, decrypted later | Hybrid X25519 + ML-KEM-768 session keys, forward secret per connection |
 | Allowlist regimes and shutdowns | An explicit degradation ladder down to mesh-only and offline — and a plain statement of where it ends |
 
@@ -54,8 +55,9 @@ python3 -m http.server 9443
 WARREN_RELAY_KEY_HEX=<private half> go run ./cmd/node -listen=127.0.0.1:8443 \
   -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 
-# 4. a bridge descriptor, as an out-of-band channel would distribute it
-echo "127.0.0.1:8443|www.example.com|<public half>" > bridges.txt
+# 4. the bridge-distribution trust anchor, then a signed descriptor
+eval "$(go run ./cmd/bootstrap -genkey 2>/dev/null)"
+go run ./cmd/bootstrap -sign -bridge="127.0.0.1:8443|www.example.com|<public half>" > bridges.txt
 
 # 5. a genuine Warren client
 go run ./cmd/cli -bridge-file=bridges.txt -message="hello from behind the firewall"
@@ -70,6 +72,7 @@ Details and known gaps: [`docs/protocol/reality-transport.md`](docs/protocol/rea
 | Component | Path | State |
 |-----------|------|-------|
 | Bridge discovery (DNS TXT / file / static, partial-failure tolerant) | `internal/discovery/bootstrap` | Implemented + tested |
+| Signed, expiring bridge descriptors (Ed25519; `bootstrap -genkey/-sign/-verify`) | `internal/discovery/bootstrap`, `cmd/bootstrap` | Implemented + tested |
 | Camouflaged transport (tagged ClientHello, real-site fallback, TLS-record framing) | `internal/network/transport` | Tested, documented gaps |
 | Session handshake (X25519 + ML-KEM-768 hybrid, forward secret, replay-protected) | `internal/network/transport` | Tested |
 | Relay pool, routing, reputation, exit policy | — | Not started |

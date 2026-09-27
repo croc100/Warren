@@ -30,7 +30,7 @@ when a month ends.
 
 | # | Slice | Gate | Status |
 |---|-------|------|--------|
-| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | 🚧 (handshake done; signed descriptors + borrowed handshake left) |
+| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | 🚧 (handshake + signed descriptors done; borrowed handshake decision left) |
 | 2 | L1 breadth + L0 distribution | Fresh client still connects with UDP/443 blocked, primary transport blocked, and bridge list expired | ⬜ |
 | 3 | L2 relay pool | 20+ node testbed usable for interactive browsing while a 24h discovery-harvesting adversary recovers < stated fraction of the pool | ⬜ |
 | 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |
@@ -63,7 +63,11 @@ no amount of marketplace or analytics matters.
   so it can't be used to confirm a relay
 - ✅ Application data framed as TLS `application_data` records (the bespoke 4-byte
   length prefix is gone), with the record header authenticated as AEAD associated data
-- ⬜ Signed, expiring bridge descriptors
+- ✅ Signed, expiring bridge descriptors (`warren-bridges/1`, Ed25519 over the
+  literal wire bytes), with `bootstrap -genkey/-sign/-verify`. File and DNS
+  channels fail closed without a trust anchor; expiry surfaces as *stale
+  discovery* rather than *no bridges*, so blocking every channel for a week does
+  not strand clients that already hold working addresses
 - ⬜ Complete the borrowed TLS handshake, or migrate to an audited REALITY
   implementation — upstream REALITY is X25519-only, so adopting it as-is would
   trade the post-quantum property for the mimicry property

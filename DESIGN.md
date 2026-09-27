@@ -57,7 +57,7 @@ repository contains roughly 1,700 lines of Go, and exactly two things work:
 
 | Layer | Component | Status |
 |-------|-----------|--------|
-| L0 | `internal/discovery/bootstrap` — multi-channel bridge resolution (DNS TXT / file / static), partial-failure tolerant | **Implemented + tested** |
+| L0 | `internal/discovery/bootstrap` — multi-channel bridge resolution (DNS TXT / file / static), signed and expiring descriptors, partial-failure tolerant | **Implemented + tested** |
 | L1 | `internal/network/transport` — tagged ClientHello with real-site fallback splice, hybrid post-quantum session handshake (X25519 + ML-KEM-768), TLS-record framing, replay cache | **Implemented + tested (known gaps)** |
 | L2 | Relay pool, routing, reputation | Not started |
 | L3 | Payment channels, contracts | Solidity sketches only, never compiled or deployed |
@@ -293,21 +293,28 @@ out-of-band distribution), and a compiled-in static list of last resort.
 ### 5.1 Additions required by the 2026 environment
 
 - **Encrypted-transport resolvers.** Plain DNS TXT is trivially tampered with at
-  the resolver. Add DoH/DoQ resolvers, and treat an unencrypted DNS answer as
-  untrusted input requiring signature verification.
-- **Signed bridge lists.** Every bridge list, regardless of channel, carries a
-  detached signature over `(bridges, issued_at, expiry)` verified against a key
-  shipped in the client. This makes a hostile channel a denial-of-service
-  problem, not an attack that can steer clients onto censor-run relays.
+  the resolver. Add DoH/DoQ resolvers. (Every DNS answer is already treated as
+  untrusted input requiring signature verification, which is the part that
+  matters for integrity; encryption is about not advertising the query.)
+- ✅ **Signed bridge lists.** Every descriptor carries an Ed25519 signature over
+  `(version, issued, expires, bridges)` — including each relay's identity key —
+  verified against an anchor shipped in the client. The signature covers the
+  literal wire bytes rather than a re-serialization of parsed fields. Channels a
+  censor can influence (file, DNS) fail closed without an anchor; only the
+  compiled-in static list needs none. A hostile channel is now a
+  denial-of-service problem, not an attack that can steer clients onto
+  censor-run relays.
 - **Client distribution as an L0 concern.** Bridges are useless without a client.
   Required: reproducible builds, verifiable release artifacts, and at least three
   distribution channels that are not the two mainstream app stores (direct
   download with signature, F-Droid-style repository, and a peer-to-peer/sideload
   path). A blocked update channel must degrade to "old client keeps working with
   stale bridges", never to "client cannot start".
-- **Staleness is a first-class state.** A client whose newest signed bridge list
-  is older than its expiry reports *stale discovery*, not *no bridges*, and keeps
-  trying every channel with jittered backoff.
+- ✅ **Staleness is a first-class state.** An expired descriptor still yields
+  bridges, marked stale; `Multi` prefers fresh copies for the same relay and
+  reports which channels serve only stale data. Treating expiry as fatal would
+  let a censor strand clients by blocking every channel for a week. Jittered
+  retry across channels is still to do.
 
 ### 5.2 Explicit non-mechanism
 
@@ -752,8 +759,8 @@ kilobit link.
 | Statistical flow classification | State classifier | Shaping regimes with stated cost (§6.4) | Not started |
 | IP/ASN blocklisting | Bulk range blocking | Residential pool scale + churn (§7.1) | Not started |
 | Relay pool enumeration | Censor harvesting the pool | No global list; rotating per-requester subsets; token-rate-limited discovery (§7.2) | Design changed, not started |
-| Discovery takedown | Blocking the bridge source | Multi-channel resolvers, signed lists, no central API (§5) | Implemented (signing: gap) |
-| Hostile discovery channel steering clients to a censor-run relay | Censor operating a bridge channel | Per-relay identity key in the descriptor: a client cannot authenticate to a relay whose key it wasn't given | Implemented |
+| Discovery takedown | Blocking the bridge source | Multi-channel resolvers, signed expiring descriptors, no central API (§5) | Implemented |
+| Hostile discovery channel steering clients to a censor-run relay | Censor operating or tampering with a bridge channel | Signed descriptors covering each relay's identity key; resolvers fail closed without a trust anchor | Implemented |
 | Captured-hello replay | Probe re-sending a recorded hello | Bounded replay cache on `client_random`; a repeat is spliced to the real site (§6.1) | Implemented |
 | Client distribution takedown | App-store removal orders | Reproducible builds, ≥3 non-app-store channels (§5.1) | Not started |
 | Throttling instead of blocking | State traffic management | Goodput-based health, degraded-vs-blocked signal (§7.3, §9) | Not started |
@@ -855,7 +862,7 @@ predecessor's gate is met.
       identity keys carried in the bridge descriptor
 - [x] Replay cache, so a captured hello can't be used to confirm a relay
 - [x] TLS-record framing for application data (no bespoke length prefix)
-- [ ] Signed, expiring bridge descriptors
+- [x] Signed, expiring bridge descriptors, with staleness as a reported state
 - [ ] Complete borrowed TLS handshake, or migration to an audited REALITY
       implementation — note upstream REALITY is X25519-only, so adopting it
       as-is trades the post-quantum property for the mimicry property
