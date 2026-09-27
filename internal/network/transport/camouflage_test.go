@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -484,4 +486,67 @@ func recordTypes(t *testing.T, stream []byte, n int) []byte {
 		stream = stream[end:]
 	}
 	return types
+}
+
+// TestSpliceMirrorsUpstreamReset covers a distinguisher the probe harness found:
+// a real HTTPS server given plaintext HTTP typically aborts the connection with
+// an RST, and a relay that relays the site's bytes but then closes cleanly with
+// a FIN is separable on TCP teardown alone — no TLS analysis required.
+func TestSpliceMirrorsUpstreamReset(t *testing.T) {
+	// A fallback "site" that aborts every connection the way OpenSSL does when
+	// it is handed something that isn't TLS.
+	site, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { site.Close() })
+	go func() {
+		for {
+			c, err := site.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				c.Read(make([]byte, 64))
+				if tcp, ok := c.(*net.TCPConn); ok {
+					tcp.SetLinger(0)
+				}
+				c.Close()
+			}(c)
+		}
+	}()
+
+	priv, _, err := GenerateServerIdentity()
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go Serve(ctx, ln, Config{
+		ServerPrivateKey: priv,
+		FallbackSNI:      "www.example.com",
+		FallbackAddr:     site.Addr().String(),
+	}, func(conn net.Conn) { conn.Close() })
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("GET / HTTP/1.0\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err = io.ReadFull(conn, make([]byte, 16))
+	if !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("got %v, want ECONNRESET mirrored from the upstream site", err)
+	}
 }

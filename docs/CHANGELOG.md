@@ -2,6 +2,49 @@
 
 All notable changes to Warren. Newest first.
 
+## 2026-09-28 — L1 gate: active-probe and record-shape harness (ADR 0001 Stage 0)
+
+### Added
+
+- `internal/network/probe` + `cmd/probe`: taps a genuine Warren session and a
+  real TLS session to the same borrowed site, compares record shape (server
+  flight after ChangeCipherSpec, record-type sequence, ClientHello and
+  ServerHello sizes), and runs an active probe suite against both endpoints —
+  browser-shaped handshake with certificate inspection, two sequential
+  handshakes, plaintext HTTP, record-shaped junk, a truncated hello, and a replay
+  of a captured genuine ClientHello. Exits non-zero on any distinguisher, so it
+  can gate a release.
+- A harness self-test asserting it *does* detect the known missing certificate
+  flight. A measurement tool that cannot find a defect we already know about is
+  not evidence of anything; when Stage A lands, that test's expectation flips.
+
+### Fixed — both found by the harness on its first run
+
+- **ClientHello was ~250 bytes short of the profile it parroted.**
+  `PubClientHelloMsg.Marshal()` only emits extensions it knows about and drops
+  everything that lives solely in `uconn.Extensions` — for a current Chrome
+  profile that includes the GREASE ECH block. Now marshaled through
+  `UConn.MarshalClientHello()`, with the key share patched in the
+  `KeyShareExtension` where the wire bytes actually come from. This was a
+  first-packet size distinguisher, invisible to unit tests that compare Warren
+  against itself.
+- **TCP teardown used FIN where the real site sends RST.** A real HTTPS server
+  handed plaintext HTTP aborts the connection; the relay spliced the site's bytes
+  faithfully and then closed cleanly, which is separable on teardown alone with no
+  TLS analysis. The splice now mirrors an upstream reset. A Go-backed test site
+  hid this (it closes cleanly); an OpenSSL-backed site exposed it.
+
+### Notes
+
+- Comparison thresholds tolerate a profile's own variance: a current Chrome hello
+  moves in 32-byte steps across a ~100-byte band because of the GREASE ECH
+  payload, and a harness that reports that as a finding is one people stop
+  reading.
+- `cmd/probe` currently reports two distinguishers against a local OpenSSL-backed
+  site — the missing certificate flight and the record sequence that follows from
+  it. That is the same defect twice and is exactly what ADR 0001 Stage A
+  addresses, which is now the next implementation task.
+
 ## 2026-09-28 — ADR 0001: how L1's handshake-mimicry gap gets closed
 
 Decision recorded in [`docs/adr/0001-borrowed-tls-handshake.md`](adr/0001-borrowed-tls-handshake.md).

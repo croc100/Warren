@@ -70,13 +70,37 @@ deep protocol surgery whose bugs are invisible until an adversary finds them.
 Neither, yet. The gap is closed in stages, cheapest first, and the harness comes
 before the cryptography.
 
-### Stage 0 — build the active-probe and classifier harness first
+### Stage 0 — build the active-probe and classifier harness first — **done**
 
-Slice 1's gate already requires it, and no version of this decision can be
-evaluated without it. It must measure the thing that actually matters: the
-distribution of record sizes, directions and timings of a Warren session versus
-a real session to the same borrowed site, plus an active prober that connects,
-replays and resumes. A passive signature tool (nDPI-class) is not evidence.
+Implemented as `internal/network/probe` and `cmd/probe`. It taps a Warren session
+and a real TLS session to the same borrowed site, compares record shape, and runs
+an active probe suite (browser-shaped handshake and certificate inspection, two
+sequential handshakes, plaintext HTTP, record-shaped junk, a truncated hello, and
+a replay of a captured genuine ClientHello) against both endpoints. `cmd/probe`
+exits non-zero on any distinguisher, so it can gate a release rather than be a
+report someone reads occasionally.
+
+**It found two defects on first run, which is the argument for having built it
+before the cryptography:**
+
+1. **The parroted ClientHello was ~250 bytes short of the profile it claimed to
+   be.** `PubClientHelloMsg.Marshal()` only emits extensions it knows about and
+   drops everything living solely in `uconn.Extensions` — for a current Chrome
+   profile that includes the GREASE ECH block. Fixed by marshaling through
+   `UConn.MarshalClientHello()`. A first-packet size distinguisher, and nothing
+   in the unit tests could have caught it: they compared Warren against itself.
+2. **TCP teardown did not match.** A real HTTPS server handed plaintext HTTP
+   aborts with an RST; the relay spliced the site's bytes faithfully and then
+   closed cleanly with a FIN. Separable on teardown alone, no TLS analysis
+   needed. Fixed by mirroring the upstream's reset (`SetLinger(0)` before close).
+   A Go-backed test site hid this — it closes cleanly — and only an OpenSSL-backed
+   site exposed it, which is a reminder that the harness's *reference* site has
+   to be representative.
+
+Related: comparison thresholds have to tolerate a profile's own variance. A
+current Chrome hello is not a fixed size — the GREASE ECH payload moves it in
+32-byte steps across a ~100-byte band — and a harness that reports that as a
+finding is a harness people stop reading.
 
 ### Stage A — make the server flight shape-accurate
 
@@ -122,7 +146,11 @@ later as a peer without disturbing anything above L1.
 - The current transport is **explicitly not safe for use against a live
   adversary** until Stage A lands. This is now stated in the README, DESIGN and
   protocol notes rather than left as a footnote.
-- Slice 1's gate is unchanged, and Stage 0 is the next implementation task.
+- Slice 1's gate is unchanged. Stage 0 is done; `cmd/probe` currently reports two
+  distinguishers against a local OpenSSL-backed site — the missing certificate
+  flight and the record sequence that follows from it — which are the same defect
+  seen twice and are exactly what Stage A addresses. Stage A is the next
+  implementation task.
 - Post-quantum confidentiality is not traded away at any stage.
 - A censor that runs a Warren client can still tell a relay from the borrowed
   site, because it holds a valid tag and can see the flight is synthetic. That

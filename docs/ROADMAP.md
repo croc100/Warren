@@ -68,7 +68,11 @@ no amount of marketplace or analytics matters.
   channels fail closed without a trust anchor; expiry surfaces as *stale
   discovery* rather than *no bridges*, so blocking every channel for a week does
   not strand clients that already hold working addresses
-- ⬜ Active-probe and record-shape harness ([ADR 0001](adr/0001-borrowed-tls-handshake.md), Stage 0) — the gate itself
+- ✅ Active-probe and record-shape harness ([ADR 0001](adr/0001-borrowed-tls-handshake.md),
+  Stage 0): `internal/network/probe` + `cmd/probe`, which exits non-zero on any
+  distinguisher. It found two defects on first run — a parroted ClientHello ~250 B
+  short of its own profile (dropped GREASE ECH extension) and a TCP teardown that
+  used FIN where the real site sends RST — both now fixed
 - ⬜ Shape-accurate server flight (Stage A): a real TLS 1.3 server sends a 2–6 KB
   encrypted certificate flight after its ServerHello and Warren sends nothing
   there, which is detectable from record sizes alone — **the transport is not

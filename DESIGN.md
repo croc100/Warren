@@ -53,12 +53,13 @@
 ## 0. Implementation Status
 
 This document describes a design, not a shipped system. As of this revision the
-repository contains roughly 1,700 lines of Go, and exactly two things work:
+repository contains roughly 2,900 lines of Go, and three things work:
 
 | Layer | Component | Status |
 |-------|-----------|--------|
 | L0 | `internal/discovery/bootstrap` — multi-channel bridge resolution (DNS TXT / file / static), signed and expiring descriptors, partial-failure tolerant | **Implemented + tested** |
 | L1 | `internal/network/transport` — tagged ClientHello with real-site fallback splice, hybrid post-quantum session handshake (X25519 + ML-KEM-768), TLS-record framing, replay cache | **Implemented + tested (known gaps)** |
+| L1 | `internal/network/probe`, `cmd/probe` — active-probe suite and record-shape comparison against the borrowed site; the gate | **Implemented + tested** |
 | L2 | Relay pool, routing, reputation | Not started |
 | L3 | Payment channels, contracts | Solidity sketches only, never compiled or deployed |
 | L4 | Measurement / analytics | Not started |
@@ -869,7 +870,9 @@ predecessor's gate is met.
 - [x] Replay cache, so a captured hello can't be used to confirm a relay
 - [x] TLS-record framing for application data (no bespoke length prefix)
 - [x] Signed, expiring bridge descriptors, with staleness as a reported state
-- [ ] Active-probe and record-shape harness (Stage 0 of [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md))
+- [x] Active-probe and record-shape harness (Stage 0 of [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md)),
+      which immediately found two defects: a hello ~250 B short of its own
+      profile, and FIN-instead-of-RST teardown. Both fixed
 - [ ] Shape-accurate server flight, so a Warren session's record sizes match a
       real TLS 1.3 handshake's (Stage A; removes the passive distinguisher)
 - [ ] Relayed real handshake, nested inside the hybrid session — conditional on

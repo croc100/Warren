@@ -73,12 +73,23 @@ Then act like a censor's probe: `curl -v --http1.0 http://127.0.0.1:8443/` gets 
 real response from whatever is on `-fallback-addr`, with nothing to flag. A client
 holding the wrong relay key gets the same treatment, and so does a replayed
 ClientHello.
-Details and known gaps: [`docs/protocol/reality-transport.md`](docs/protocol/reality-transport.md).
+Then run the gate — it probes the relay and the site it borrows from, and reports
+anything that separates them:
+
+```bash
+go run ./cmd/probe -relay=127.0.0.1:8443 -site=127.0.0.1:9443 \
+  -sni=www.example.com -relay-key=<relay public key>
+```
+
+Today it reports two distinguishers, both the missing certificate flight
+([ADR 0001](docs/adr/0001-borrowed-tls-handshake.md) Stage A). Details and known
+gaps: [`docs/protocol/reality-transport.md`](docs/protocol/reality-transport.md).
 
 | Component | Path | State |
 |-----------|------|-------|
 | Bridge discovery (DNS TXT / file / static, partial-failure tolerant) | `internal/discovery/bootstrap` | Implemented + tested |
 | Signed, expiring bridge descriptors (Ed25519; `bootstrap -genkey/-sign/-verify`) | `internal/discovery/bootstrap`, `cmd/bootstrap` | Implemented + tested |
+| Active-probe + record-shape harness (the L1 gate; exits non-zero on any distinguisher) | `internal/network/probe`, `cmd/probe` | Implemented + tested |
 | Camouflaged transport (tagged ClientHello, real-site fallback, TLS-record framing) | `internal/network/transport` | Tested, documented gaps |
 | Session handshake (X25519 + ML-KEM-768 hybrid, forward secret, replay-protected) | `internal/network/transport` | Tested |
 | Relay pool, routing, reputation, exit policy | — | Not started |

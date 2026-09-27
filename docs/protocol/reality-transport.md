@@ -165,6 +165,34 @@ malformed: a bridge without an identity key is unusable, and accepting it would
 push the failure to dial time, where it looks like censorship instead of a bad
 descriptor.
 
+## Measuring it
+
+`internal/network/probe` (driven by `cmd/probe`) is the gate. It taps a genuine
+Warren session and a real TLS session to the same borrowed site, compares record
+shape, and runs an active probe suite against both endpoints: a browser-shaped
+handshake with certificate inspection, two sequential handshakes, plaintext HTTP,
+record-shaped junk, a truncated hello, and a replay of a captured genuine
+ClientHello. It exits non-zero on any distinguisher.
+
+```bash
+go run ./cmd/probe -relay=127.0.0.1:8443 -site=127.0.0.1:9443 \
+  -sni=www.example.com -relay-key=<relay public key>
+```
+
+Two things it found on its first run, neither of which any unit test could have
+caught, because unit tests compare Warren against itself:
+
+- The parroted ClientHello was ~250 bytes short of the profile it claimed to be:
+  `PubClientHelloMsg.Marshal()` drops extensions that live only in
+  `uconn.Extensions`, which for a current Chrome profile includes the GREASE ECH
+  block. Fixed by marshaling through `UConn.MarshalClientHello()`.
+- TCP teardown didn't match. A real HTTPS server handed plaintext HTTP aborts
+  with an RST; the relay spliced the site's bytes and then closed cleanly with a
+  FIN, which is separable on teardown alone. Fixed by mirroring the upstream
+  reset. A Go-backed test site hid it; an OpenSSL-backed one exposed it.
+
+What it still reports, by design, is the missing certificate flight below.
+
 ## Known gaps vs. a hardened production transport
 
 - **No certificate flight after the ServerHello — and it is passively

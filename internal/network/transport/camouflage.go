@@ -41,6 +41,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -122,12 +124,28 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 	// Swap our own ephemeral keys into the hybrid key share. Same group, same
 	// length, same structure as what uTLS generated, so the hello's shape is
 	// untouched — only the bytes are ours, and only we hold the private halves.
+	//
+	// The bytes that actually go on the wire come from the *extension* objects
+	// in uconn.Extensions, not from the PubClientHelloMsg fields, so the key
+	// share has to be patched there. Both are updated: the extension is what
+	// gets marshaled, and hello.KeyShares is what uTLS reads if it ever takes
+	// the ECH path.
 	replaced := false
+	for _, ext := range uconn.Extensions {
+		ks, ok := ext.(*utls.KeyShareExtension)
+		if !ok {
+			continue
+		}
+		for i := range ks.KeyShares {
+			if ks.KeyShares[i].Group == utls.X25519MLKEM768 {
+				ks.KeyShares[i].Data = keys.share
+				replaced = true
+			}
+		}
+	}
 	for i := range hello.KeyShares {
 		if hello.KeyShares[i].Group == utls.X25519MLKEM768 {
 			hello.KeyShares[i].Data = keys.share
-			replaced = true
-			break
 		}
 	}
 	if !replaced {
@@ -143,19 +161,19 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 	}
 	hello.SessionId = sessionID
 
-	// uTLS caches the originally-built wire bytes in hello.Raw and Marshal
-	// returns that cache verbatim whenever it's non-nil — it does NOT
-	// re-encode from the struct fields by default. Since we just mutated
-	// SessionId and KeyShares, the cache is stale; clearing Raw forces Marshal
-	// to actually re-serialize, picking up our patched fields while everything
-	// else (extension order, cipher list, ALPN — the fingerprint proper) still
-	// matches what uTLS built for the parroted browser profile.
-	hello.Raw = nil
-	rawHello, err := hello.Marshal()
-	if err != nil {
+	// Marshal through uTLS rather than through PubClientHelloMsg.Marshal().
+	// The struct-field marshaler only emits the extensions it knows about and
+	// drops everything that lives solely in uconn.Extensions — for a current
+	// Chrome profile that includes the GREASE ECH block, which is a couple of
+	// hundred bytes. Using it produced a hello ~250 bytes shorter than the
+	// profile it claimed to be, a distinguisher on the very first packet. The
+	// probe harness (internal/network/probe) is what caught it, which is the
+	// argument for having the harness at all.
+	if err := uconn.MarshalClientHello(); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("transport: marshal client hello: %w", err)
 	}
+	rawHello := hello.Raw
 
 	record := make([]byte, 0, 5+len(rawHello))
 	record = append(record, recordTypeHandshake, 0x03, 0x01) // legacy record version, as Chrome sends
@@ -367,7 +385,24 @@ func peekClientHello(r *bufio.Reader) (*parsedClientHello, int, error) {
 }
 
 func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallbackAddr string) {
-	defer raw.Close()
+	// How the connection *ends* is observable too. A real HTTPS server given
+	// plaintext HTTP typically aborts with an RST; if the relay answers the same
+	// request by relaying the site's bytes and then closing cleanly with a FIN,
+	// the pair is separable on TCP teardown alone — no TLS analysis needed. So
+	// the teardown is mirrored: if the upstream reset, so do we.
+	//
+	// The probe harness (internal/network/probe) found this by comparing a relay
+	// against an OpenSSL-backed site; a Go-backed site closes cleanly and hid it.
+	var upstreamReset atomic.Bool
+	defer func() {
+		if upstreamReset.Load() {
+			if tcp, ok := raw.(*net.TCPConn); ok {
+				tcp.SetLinger(0) // makes the following Close send an RST
+			}
+		}
+		raw.Close()
+	}()
+
 	d := net.Dialer{Timeout: 5 * time.Second}
 	upstream, err := d.DialContext(ctx, "tcp", fallbackAddr)
 	if err != nil {
@@ -377,8 +412,22 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 
 	done := make(chan struct{}, 2)
 	go func() { io.Copy(upstream, br); done <- struct{}{} }()
-	go func() { io.Copy(raw, upstream); done <- struct{}{} }()
+	go func() {
+		_, err := io.Copy(raw, upstream)
+		if errors.Is(err, syscall.ECONNRESET) {
+			upstreamReset.Store(true)
+		}
+		done <- struct{}{}
+	}()
 	<-done
+
+	// One direction finishing doesn't tell us how the other ended. Wait briefly
+	// for it so a reset arriving from upstream is still mirrored, but don't block
+	// on a peer that has simply stopped reading.
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 // bufferedConn lets us keep using a bufio.Reader (which may already hold
