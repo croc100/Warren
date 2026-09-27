@@ -153,6 +153,28 @@ func deriveSessionKey(mlkemSS, ecdheSS, authSS, clientRandom, serverRandom, clie
 	return key, nil
 }
 
+// confirmation is the key-confirmation tag carried inside the shaped flight
+// (see flight.go). It proves the peer derived the same session key and binds the
+// handshake transcript, so a middlebox that rewrote the ClientHello or the
+// ServerHello on the way cannot go unnoticed.
+//
+// This is not what protects application data — the AEAD does that — which is why
+// it can safely be truncated to fit a small record.
+func confirmation(sessionKey []byte, label string, clientRandom, clientShare, serverRandom, serverShare []byte) []byte {
+	mac := hmac.New(sha256.New, sessionKey)
+	mac.Write([]byte(label))
+	mac.Write(clientRandom)
+	mac.Write(clientShare)
+	mac.Write(serverRandom)
+	mac.Write(serverShare)
+	return mac.Sum(nil)
+}
+
+const (
+	serverConfirmLabel = "warren server finished v1"
+	clientConfirmLabel = "warren client finished v1"
+)
+
 // hybridShare extracts the X25519MLKEM768 entry from a parsed ClientHello.
 func hybridShare(shares []utls.KeyShare) ([]byte, error) {
 	for _, ks := range shares {
@@ -170,47 +192,57 @@ func splitClientShare(share []byte) (encapKey, ecdhePub []byte) {
 	return share[:mlkem.EncapsulationKeySize768], share[mlkem.EncapsulationKeySize768:]
 }
 
-// serverAccept validates a client's tag and produces everything the relay
-// needs to answer: the ServerHello bytes and the derived session key.
-func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte) (serverHello, sessionKey []byte, err error) {
+// acceptResult is everything the relay needs after validating a client: the
+// ServerHello bytes to send, the session key, and the server-side halves of the
+// transcript that the key confirmation in the shaped flight binds.
+type acceptResult struct {
+	serverHello  []byte
+	sessionKey   []byte
+	serverRandom []byte
+	serverShare  []byte
+}
+
+// serverAccept validates a client's tag and produces everything the relay needs
+// to answer.
+func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte) (*acceptResult, error) {
 	if len(identityKey) != x25519KeyLen {
-		return nil, nil, ErrIdentityMissing
+		return nil, ErrIdentityMissing
 	}
 	identity, err := ecdh.X25519().NewPrivateKey(identityKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("transport: relay identity key: %w", err)
+		return nil, fmt.Errorf("transport: relay identity key: %w", err)
 	}
 
 	encapKeyBytes, clientECDHEBytes := splitClientShare(clientShare)
 	clientECDHE, err := ecdh.X25519().NewPublicKey(clientECDHEBytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("transport: client ephemeral key: %w", err)
+		return nil, fmt.Errorf("transport: client ephemeral key: %w", err)
 	}
 	authSS, err := identity.ECDH(clientECDHE)
 	if err != nil {
-		return nil, nil, fmt.Errorf("transport: derive auth secret: %w", err)
+		return nil, fmt.Errorf("transport: derive auth secret: %w", err)
 	}
 
 	if !hmac.Equal(deriveTag(authSS, clientRandom, clientShare), sessionID[:tagLen]) {
-		return nil, nil, errTagMismatch
+		return nil, errTagMismatch
 	}
 
 	encapKey, err := mlkem.NewEncapsulationKey768(encapKeyBytes)
 	if err != nil {
-		// A well-formed hybrid share whose ML-KEM half doesn't decode is
-		// not something a real browser sends; treat it like any other
-		// non-Warren input and let the caller splice to the real site.
-		return nil, nil, ErrNoHybridShare
+		// A well-formed hybrid share whose ML-KEM half doesn't decode is not
+		// something a real browser sends; treat it like any other non-Warren
+		// input and let the caller splice to the real site.
+		return nil, ErrNoHybridShare
 	}
 	mlkemSS, ciphertext := encapKey.Encapsulate()
 
 	serverECDHE, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	ecdheSS, err := serverECDHE.ECDH(clientECDHE)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	serverShare := make([]byte, 0, hybridServerShareLen)
@@ -219,14 +251,19 @@ func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte) (ser
 
 	serverRandom := make([]byte, 32)
 	if _, err := rand.Read(serverRandom); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	key, err := deriveSessionKey(mlkemSS, ecdheSS, authSS, clientRandom, serverRandom, clientShare, serverShare)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return buildServerHello(sessionID, serverRandom, serverShare), key, nil
+	return &acceptResult{
+		serverHello:  buildServerHello(sessionID, serverRandom, serverShare),
+		sessionKey:   key,
+		serverRandom: serverRandom,
+		serverShare:  serverShare,
+	}, nil
 }
 
 var errTagMismatch = errors.New("transport: client hello tag mismatch")
@@ -270,34 +307,50 @@ func buildServerHello(sessionIDEcho, serverRandom, serverShare []byte) []byte {
 }
 
 // parseServerHello pulls the server random and hybrid key_share out of a
-// ServerHello handshake body.
+// ServerHello handshake body, rejecting anything that isn't the group Warren
+// hides its handshake in.
 func parseServerHello(body []byte) (serverRandom, serverShare []byte, err error) {
+	serverRandom, group, share, err := parseServerHelloParts(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	if group != uint16(utls.X25519MLKEM768) || len(share) != hybridServerShareLen {
+		return nil, nil, ErrBadServerHello
+	}
+	return serverRandom, share, nil
+}
+
+// parseServerHelloParts is the group-agnostic version, used when profiling a
+// borrowed site: there we need to know *which* group the site actually
+// negotiated, because a site that doesn't offer the hybrid group cannot
+// plausibly be the one answering a hybrid ClientHello.
+func parseServerHelloParts(body []byte) (serverRandom []byte, group uint16, share []byte, err error) {
 	// server_hello(1) + length(3) + legacy_version(2) + random(32) + session_id_len(1)
 	if len(body) < 39 || body[0] != 0x02 {
-		return nil, nil, ErrBadServerHello
+		return nil, 0, nil, ErrBadServerHello
 	}
 	p := body[4:]
 	if len(p) < 35 {
-		return nil, nil, ErrBadServerHello
+		return nil, 0, nil, ErrBadServerHello
 	}
 	serverRandom = append([]byte(nil), p[2:34]...)
 	sidLen := int(p[34])
 	p = p[35:]
 	if len(p) < sidLen+2+1+2 {
-		return nil, nil, ErrBadServerHello
+		return nil, 0, nil, ErrBadServerHello
 	}
 	p = p[sidLen+3:] // session_id + cipher_suite(2) + compression(1)
 
 	extLen := int(p[0])<<8 | int(p[1])
 	p = p[2:]
 	if len(p) < extLen {
-		return nil, nil, ErrBadServerHello
+		return nil, 0, nil, ErrBadServerHello
 	}
 	for ext := p[:extLen]; len(ext) >= 4; {
 		extType := uint16(ext[0])<<8 | uint16(ext[1])
 		bodyLen := int(ext[2])<<8 | int(ext[3])
 		if len(ext) < 4+bodyLen {
-			return nil, nil, ErrBadServerHello
+			return nil, 0, nil, ErrBadServerHello
 		}
 		payload := ext[4 : 4+bodyLen]
 		ext = ext[4+bodyLen:]
@@ -305,14 +358,14 @@ func parseServerHello(body []byte) (serverRandom, serverShare []byte, err error)
 		if extType != extKeyShare || len(payload) < 4 {
 			continue
 		}
-		group := uint16(payload[0])<<8 | uint16(payload[1])
+		group = uint16(payload[0])<<8 | uint16(payload[1])
 		shareLen := int(payload[2])<<8 | int(payload[3])
-		if group != uint16(utls.X25519MLKEM768) || len(payload) < 4+shareLen || shareLen != hybridServerShareLen {
-			return nil, nil, ErrBadServerHello
+		if len(payload) < 4+shareLen {
+			return nil, 0, nil, ErrBadServerHello
 		}
-		return serverRandom, append([]byte(nil), payload[4:4+shareLen]...), nil
+		return serverRandom, group, append([]byte(nil), payload[4:4+shareLen]...), nil
 	}
-	return nil, nil, ErrBadServerHello
+	return nil, 0, nil, ErrBadServerHello
 }
 
 func appendUint16(b []byte, v uint16) []byte { return append(b, byte(v>>8), byte(v)) }

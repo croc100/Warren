@@ -47,10 +47,12 @@ The relay peeks the first record on every inbound connection:
 
 - **Tag valid, random not seen before** → a genuine Warren client. The relay
   answers with a real-shaped TLS 1.3 **ServerHello** carrying the ML-KEM
-  ciphertext and its own ephemeral X25519 key in a `key_share` extension, plus
-  a `ChangeCipherSpec` record; the client answers with its own
-  `ChangeCipherSpec`. Both sides then derive the session key and application
-  data flows in records framed as TLS `application_data`.
+  ciphertext and its own ephemeral X25519 key in a `key_share` extension, a
+  `ChangeCipherSpec`, and then a **flight shaped from a measurement of the
+  borrowed site** (below). The client answers with a `ChangeCipherSpec` and a
+  Finished-sized confirmation; the relay follows with session-ticket-shaped
+  records. Application data then flows in records framed as TLS
+  `application_data`.
 - **Tag invalid, absent, malformed, or replayed** → the raw bytes are spliced
   byte-for-byte to a real fallback site. Whoever sent them — an ordinary
   non-Warren client or a censor's active probe — gets a genuine response from
@@ -60,6 +62,70 @@ So the record-type sequence a client emits is `handshake`,
 `change_cipher_spec`, `application_data …` — exactly what a real TLS 1.3 client
 in middlebox-compatibility mode emits, which is asserted by
 `TestClientWireShapeIsTLSRecords`.
+
+## The shaped flight
+
+A real TLS 1.3 server does not go quiet after its ServerHello. It sends
+EncryptedExtensions, Certificate, CertificateVerify and Finished — usually a
+couple of kilobytes of encrypted records — the client answers with a small
+Finished, and the server typically follows with session tickets. Warren used to
+send nothing there, and a classifier separates that on record sizes alone, with no
+decryption and no Warren client of its own.
+
+**A constant could not fix it.** How that flight looks is a property of the site
+and the TLS stack behind it: Go emits one record per handshake message, OpenSSL
+coalesces several, certificate chains differ by kilobytes between sites, and ticket
+counts and sizes differ again. A hardcoded pad would make every Warren relay look
+like the same server that doesn't exist — which is a worse position than an obvious
+gap, because it is a *positive* signature rather than an absence.
+
+So the relay measures. `ProfileSite` performs a genuine TLS handshake with the
+borrowed site using the same parroted fingerprint a Warren client would, taps it at
+the record layer, and records:
+
+| Measured | Used for |
+|---|---|
+| Record sizes, order and pacing between the server's CCS and the client's Finished | The flight the relay emits to a Warren client |
+| Records after the client's Finished | Session-ticket-shaped records after the client's confirmation |
+| The client's Finished record size | How big the Warren client's confirmation record must be |
+| ServerHello size | A sanity check against Warren's own (~1210 B with a hybrid share) |
+| The negotiated key-exchange group, read off the wire | Whether this site is usable as cover at all |
+
+That last row is a security decision, not bookkeeping. Warren's ServerHello carries
+a 1120-byte hybrid key share, so a site negotiating classical X25519 answers with a
+ServerHello hundreds of bytes smaller: pairing with it would make the *first server
+packet* a distinguisher. A profile that doesn't negotiate `X25519MLKEM768` is
+rejected, and `node -profile-only` lets an operator check a candidate site before
+committing to it.
+
+**The records are not padding.** Every Warren record's plaintext begins with a kind
+byte (`data`, `filler`, `confirm`), and the largest record of the flight carries a
+`confirm`: an HMAC over the session key and the whole transcript
+(`client_random ‖ client_share ‖ server_random ‖ server_share`). So the client gets
+key confirmation before it sends anything, and any rewriting of the ClientHello or
+ServerHello in transit is caught. The client answers with its own confirmation in a
+Finished-sized record. Filler records never reach a caller's `Read`, which is also
+the mechanism the traffic-shaping regimes in DESIGN.md §6.4 will reuse.
+
+**Ordering is explicit rather than timed.** The confirmation says how many flight
+records follow it, so the client answers only once the whole flight has arrived. A
+timing heuristic would put the client's ChangeCipherSpec in the middle of the
+server's flight on a slow link, which is exactly the ordering this is trying to get
+right.
+
+**Operational rules that follow:**
+
+- A relay with no usable profile **refuses to serve**. A relay that cannot imitate
+  its site announces itself to anyone measuring, and serving clients anyway would
+  put them at more risk than not running at all.
+- Profiles are **re-measured on a schedule** (`-profile-refresh`, default 30
+  minutes), because certificates rotate and TLS stacks get reconfigured. A failed
+  or implausible re-measurement keeps the last good profile: a transient outage at
+  the borrowed site should not take the relay down.
+- Profiling **verifies the site's certificate** by default. A censor able to
+  intercept the relay's own profiling connection could otherwise feed it a bogus
+  shape, and the relay would then faithfully imitate a server that doesn't exist.
+  `-profile-insecure` exists for local, self-signed test sites.
 
 ## The session handshake
 
@@ -191,27 +257,33 @@ caught, because unit tests compare Warren against itself:
   FIN, which is separable on teardown alone. Fixed by mirroring the upstream
   reset. A Go-backed test site hid it; an OpenSSL-backed one exposed it.
 
-What it still reports, by design, is the missing certificate flight below.
+A third bug surfaced while wiring the shaped flight in, and it was the most
+interesting of the three: **uTLS parses a ClientHello zero-copy**, so the parsed
+hello points into the `bufio` buffer the record was peeked from, and every later
+read on that reader overwrites those bytes. The tag check happens before any
+further read, so it was fine; the key confirmation is computed after the client's
+own records have arrived, at which point the "client random" and "client share"
+were whatever had landed most recently. It presented as an intermittent
+confirmation failure that vanished under a debug print — a timing-dependent
+correctness bug of the kind that a shape test would never find and a slow CI
+machine finds at the worst moment. Fixed by having the parse take copies.
 
 ## Known gaps vs. a hardened production transport
 
-- **No certificate flight after the ServerHello — and it is passively
-  detectable.** A real TLS 1.3 server follows its ServerHello and
-  ChangeCipherSpec with EncryptedExtensions, Certificate, CertificateVerify and
-  Finished: typically 2–6 KB of `application_data` records, answered by a small
-  client Finished. Warren sends nothing there. A classifier needs no decryption
-  and no Warren client to notice "TLS 1.3 session whose server flight after CCS
-  is under 200 bytes"; record sizes and directions are enough. **This is the
-  highest-priority remaining defect, and until it is fixed the transport is not
-  safe against a live adversary.**
-
-  What works in our favour is that TLS 1.3 *encrypts* the certificate flight, so
-  a passive observer can never validate a certificate — only measure the shape —
-  and an active prober is already spliced to the real site and gets that site's
-  genuine chain. So the fix is staged: shape-accurate synthetic records first, a
-  relayed real handshake only if measurement says that is not enough, and never
-  at the cost of the post-quantum property. See
-  [ADR 0001](../adr/0001-borrowed-tls-handshake.md).
+- **The flight is shaped like a real handshake but is not one.** There is no
+  certificate to verify, so a censor that runs its own Warren client — it holds a
+  valid tag, so it can decrypt the flight and see the records are filler — can tell
+  a relay from the borrowed site. This is accepted rather than unfixed: such an
+  adversary can enumerate bridges through discovery anyway, which is an anti-
+  enumeration problem at L2 (DESIGN.md §7.2), not something protocol mimicry
+  solves. What works in our favour against everyone else is that TLS 1.3
+  *encrypts* the certificate flight, so a passive observer can only measure shape,
+  and an active prober is spliced to the real site and gets its genuine chain.
+- **A TLS-intercepting middlebox breaks Warren where it would not break a real
+  session.** A censor running its own CA terminates and re-originates TLS; a real
+  session survives that, Warren's does not. This is the durable reason Stage B of
+  [ADR 0001](../adr/0001-borrowed-tls-handshake.md) exists, and it is conditional
+  on a target region actually deploying one.
 - **Traffic shape is unmodified.** DESIGN.md's `bucket`/`cover` regimes
   (§6.4) aren't implemented; record sizes track payload sizes, so a flow
   classifier still sees Warren's own size and timing distribution.
@@ -238,8 +310,10 @@ go run ./cmd/node -genkey                        # prints a pair; note the publi
 # 2. a stand-in "real site" the relay borrows an identity from
 python3 -m http.server 9443
 
-# 3. the relay
-go run ./cmd/node -listen=127.0.0.1:8443 \
+# 3. check the site is usable as cover, then run the relay
+go run ./cmd/node -profile-only -profile-insecure \
+  -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
+go run ./cmd/node -listen=127.0.0.1:8443 -profile-insecure \
   -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 
 # 4. the bridge-distribution trust anchor (signing key stays offline)
@@ -269,7 +343,13 @@ is indistinguishable from a web server.
 go test ./internal/network/transport/... ./internal/discovery/bootstrap/... -race
 ```
 
-Covers: the full hybrid handshake round trip; untagged input spliced to the real
+Covers: the shaped flight reproducing a profile's record sizes exactly, in order,
+including the post-handshake records and the client's Finished size; a relay
+refusing to serve without a usable profile, with a non-hybrid site, or with a
+flight too small to carry a confirmation; a client rejecting a bad server
+confirmation; filler records staying invisible to callers across arbitrary
+interleavings; two measurements of the same site agreeing; the full hybrid
+handshake round trip; untagged input spliced to the real
 site without reaching the Warren handler; a client holding the **wrong relay
 key** treated as a probe; a **replayed ClientHello** spliced to the real site;
 a **segmented ClientHello** (delivered in 137-byte chunks through a fragmenting

@@ -30,7 +30,7 @@ when a month ends.
 
 | # | Slice | Gate | Status |
 |---|-------|------|--------|
-| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | 🚧 (handshake + signed descriptors done; borrowed handshake decision left) |
+| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | ✅ gate passes (Stage B of ADR 0001 remains conditional) |
 | 2 | L1 breadth + L0 distribution | Fresh client still connects with UDP/443 blocked, primary transport blocked, and bridge list expired | ⬜ |
 | 3 | L2 relay pool | 20+ node testbed usable for interactive browsing while a 24h discovery-harvesting adversary recovers < stated fraction of the pool | ⬜ |
 | 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |
@@ -73,19 +73,28 @@ no amount of marketplace or analytics matters.
   distinguisher. It found two defects on first run — a parroted ClientHello ~250 B
   short of its own profile (dropped GREASE ECH extension) and a TCP teardown that
   used FIN where the real site sends RST — both now fixed
-- ⬜ Shape-accurate server flight (Stage A): a real TLS 1.3 server sends a 2–6 KB
-  encrypted certificate flight after its ServerHello and Warren sends nothing
-  there, which is detectable from record sizes alone — **the transport is not
-  safe against a live adversary until this lands**
+- ✅ Shape-accurate server flight (Stage A): the relay measures the site it borrows
+  from — `ProfileSite` does a genuine handshake and records sizes, order, pacing,
+  session tickets and a real client's Finished size — and replays that shape, with
+  Warren's key confirmation riding in the largest record. Verified byte-exact
+  against a real session by `cmd/probe`. A relay with no usable profile refuses to
+  serve, and a site that doesn't negotiate `X25519MLKEM768` is rejected as cover
+  because its real ServerHello is hundreds of bytes smaller than Warren's
 - ⬜ Relayed real handshake nested inside the hybrid session (Stage B), only if
   the harness shows Stage A is still separable. The mimicry-versus-post-quantum
   trade-off was a false choice: the outer borrowed handshake carries shape, the
   inner hybrid handshake carries confidentiality
 
-**Gate:** an isolated active-probe harness — connect, replay, resume — cannot
-distinguish a Warren relay from the borrowed site, and the client's hello is not
-separable by key-share, size, or version features from the profile it parrots.
-A passive signature tool (nDPI-class) is not sufficient evidence.
+**Gate: passing.** `cmd/probe` runs six active probes (browser-shaped handshake
+with certificate inspection, two sequential handshakes, plaintext HTTP,
+record-shaped junk, a truncated hello, and a replay of a captured genuine
+ClientHello) and five shape measurements against both a relay and the site it
+borrows, and exits non-zero on any distinguisher. It currently reports none, with
+the flight byte-exact.
+
+What the gate does **not** cover, and why Slice 1 passing is not deployability:
+the shape of application traffic after the handshake (Slice 2) and relay-pool
+enumeration (Slice 3).
 
 ---
 

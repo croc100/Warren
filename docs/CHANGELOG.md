@@ -2,6 +2,73 @@
 
 All notable changes to Warren. Newest first.
 
+## 2026-09-28 — L1: the server flight is shaped from a measurement of the borrowed site (ADR 0001 Stage A)
+
+`cmd/probe` now reports no distinguisher: the flight is byte-exact against a real
+session to the same site (1196 B in 4 records, plus 500 B in 2 post-handshake
+records, in the local OpenSSL-backed setup), and the record sequence matches.
+
+### Added
+
+- `internal/network/transport/flight.go`: `ProfileSite` performs a genuine TLS
+  handshake with the borrowed site using the same parroted fingerprint a Warren
+  client would, taps it at the record layer, and records the shape of the answer —
+  record sizes, order and pacing, post-handshake records, the size of a real
+  client's Finished, the ServerHello size, and the negotiated key-exchange group
+  read off the wire. `AtomicFlight` holds the current profile so a long-running
+  relay can re-measure without a restart.
+- Shaped records in `aead_conn.go`: every record's plaintext now starts with a kind
+  byte (`data`, `filler`, `confirm`), so the relay can emit records whose purpose is
+  to occupy the space a real server's certificate flight would have used. Filler
+  never reaches a caller's `Read`. This is also the mechanism DESIGN.md §6.4's
+  traffic-shaping regimes will reuse.
+- Key confirmation: the largest flight record carries an HMAC over the session key
+  and the whole transcript, so the client has proof the relay derived the same key
+  before it sends anything, and any rewriting of the ClientHello or ServerHello in
+  transit is detected. The client answers in a Finished-sized record. The
+  confirmation also states how many flight records follow it, so ordering is
+  explicit instead of timed — a timing heuristic would put the client's
+  ChangeCipherSpec in the middle of the server's flight on a slow link.
+- `internal/network/tlsrec`: the record-layer vocabulary, shared by the transport
+  (which shapes records) and the probe harness (which measures them), so the thing
+  measured and the thing measuring cannot disagree about a record boundary.
+- `cmd/node`: measures its fallback site at startup and refuses to run if the site
+  is unusable, re-measures on `-profile-refresh` (default 30 minutes), and
+  `-profile-only` prints a candidate site's shape so an operator can check it
+  before committing. Profiling verifies the site's certificate by default;
+  `-profile-insecure` is for local self-signed sites.
+- `cmd/probe` gained a post-handshake (session ticket) measurement, and its drivers
+  now pause before sending a payload so that window is observable at all.
+
+### Why not a hardcoded pad
+
+How a server's flight looks is a property of the site and its TLS stack: Go emits
+one record per handshake message, OpenSSL coalesces several, certificate chains
+differ by kilobytes between sites, ticket counts differ again. A constant would have
+made every Warren relay look like the same server that doesn't exist — a positive
+signature rather than an absence, which is worse than the gap it replaced.
+
+### Changed
+
+- A relay **refuses to serve without a usable flight profile**, and a profile that
+  does not negotiate `X25519MLKEM768` is rejected. Warren's ServerHello carries a
+  1120-byte hybrid key share, so a site negotiating classical X25519 answers with a
+  ServerHello hundreds of bytes smaller — pairing with it would make the first
+  server packet a distinguisher. Site selection is now a machine-checkable step.
+- The probe harness's self-test flipped: it used to assert the harness *detected*
+  the missing flight, which was the right assertion while the gap existed and is why
+  the harness was built first. It now asserts the shapes match.
+
+### Fixed
+
+- **uTLS parses a ClientHello zero-copy**, so the parsed hello pointed into the
+  `bufio` buffer the record was peeked from, and later reads on that reader
+  overwrote those bytes. The tag check runs before any further read and was fine,
+  but the new key confirmation is computed after the client's own records arrive, at
+  which point "client random" and "client share" were whatever had landed most
+  recently. It presented as an intermittent confirmation failure that vanished
+  under a debug print. The parse now takes copies.
+
 ## 2026-09-28 — L1 gate: active-probe and record-shape harness (ADR 0001 Stage 0)
 
 ### Added

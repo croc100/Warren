@@ -113,6 +113,12 @@ func driveWarren(cfg transport.Config) func(context.Context, string) error {
 			return err
 		}
 		defer conn.Close()
+		// Pause before sending the payload. Post-handshake records — session
+		// tickets — race the client's first request on a real connection, and
+		// without a gap the measurement window for them is empty on both sides,
+		// which would report "no tickets" as a match. The pause makes that part
+		// of the shape observable.
+		time.Sleep(400 * time.Millisecond)
 		if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + cfg.FallbackSNI + "\r\n\r\n")); err != nil {
 			return err
 		}
@@ -137,6 +143,12 @@ func driveRealTLS(sni string) func(context.Context, string) error {
 		if err := conn.Handshake(); err != nil {
 			return err
 		}
+		// Pause before sending the payload. Post-handshake records — session
+		// tickets — race the client's first request on a real connection, and
+		// without a gap the measurement window for them is empty on both sides,
+		// which would report "no tickets" as a match. The pause makes that part
+		// of the shape observable.
+		time.Sleep(400 * time.Millisecond)
 		if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + sni + "\r\nConnection: close\r\n\r\n")); err != nil {
 			return err
 		}

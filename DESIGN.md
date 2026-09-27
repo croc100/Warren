@@ -53,12 +53,13 @@
 ## 0. Implementation Status
 
 This document describes a design, not a shipped system. As of this revision the
-repository contains roughly 2,900 lines of Go, and three things work:
+repository contains roughly 5,500 lines of Go (about half of it tests), and three
+things work:
 
 | Layer | Component | Status |
 |-------|-----------|--------|
 | L0 | `internal/discovery/bootstrap` — multi-channel bridge resolution (DNS TXT / file / static), signed and expiring descriptors, partial-failure tolerant | **Implemented + tested** |
-| L1 | `internal/network/transport` — tagged ClientHello with real-site fallback splice, hybrid post-quantum session handshake (X25519 + ML-KEM-768), TLS-record framing, replay cache | **Implemented + tested (known gaps)** |
+| L1 | `internal/network/transport` — tagged ClientHello with real-site fallback splice, hybrid post-quantum session handshake (X25519 + ML-KEM-768), TLS-record framing, replay cache, measured borrowed-site flight imitation | **Implemented + tested (known gaps)** |
 | L1 | `internal/network/probe`, `cmd/probe` — active-probe suite and record-shape comparison against the borrowed site; the gate | **Implemented + tested** |
 | L2 | Relay pool, routing, reputation | Not started |
 | L3 | Payment channels, contracts | Solidity sketches only, never compiled or deployed |
@@ -368,15 +369,47 @@ recent `client_random` values and treats a repeat like any unauthenticated
 connection — spliced to the real site — so a censor cannot confirm a relay by
 replaying one recording.
 
-Remaining gaps are documented in `docs/protocol/reality-transport.md`; the
-blocking one is now the state machine after the ServerHello, not the key
-schedule — and it is **passively** detectable, which makes the current transport
-unsafe against a live adversary. A real TLS 1.3 server follows its ServerHello
-with a 2–6 KB encrypted certificate flight; Warren sends nothing there, and a
-classifier needs only record sizes and directions to notice. How that gets
-closed — shape-accurate synthetic flights first, a relayed real handshake only if
-measurement says so, and never by trading away post-quantum confidentiality — is
-[ADR 0001](docs/adr/0001-borrowed-tls-handshake.md).
+**The flight after the ServerHello is shaped from a measurement of the borrowed
+site**, which closes what was the blocking gap. A real TLS 1.3 server follows its
+ServerHello with EncryptedExtensions, Certificate, CertificateVerify and Finished
+— kilobytes of encrypted records — and then session tickets; a peer that sends
+nothing there is separable on record sizes alone, with no decryption and no Warren
+client of its own.
+
+That could not be fixed with a constant. How the flight looks is a property of the
+site and its TLS stack: Go emits one record per handshake message, OpenSSL
+coalesces several, certificate chains differ by kilobytes, ticket counts differ
+again. A hardcoded pad would make every relay look like the same server that does
+not exist. So the relay performs a genuine TLS handshake with the site it borrows
+from, records the exact record-level shape of the answer (sizes, order, pacing,
+post-handshake records, and the size of a real client's Finished), and replays it —
+re-measuring periodically, because certificates rotate.
+
+Those records are not padding. The largest one carries Warren's **key
+confirmation**: an HMAC over the session key and the full transcript
+(`client_random ‖ client_share ‖ server_random ‖ server_share`), which gives the
+client proof the relay derived the same key before it sends anything, and detects
+any rewriting of the ClientHello or ServerHello in transit. The client answers with
+its own confirmation in a record sized like a real client's Finished.
+
+Two consequences worth stating plainly:
+
+- **A relay with no usable profile refuses to serve.** Not a warning: a relay that
+  cannot imitate its site announces itself to anyone measuring, and serving
+  clients anyway would put them at more risk than not running.
+- **Site selection is now a security decision with a machine-checkable rule.**
+  Warren's ServerHello carries a 1120-byte hybrid key share, so a site that
+  negotiates classical X25519 answers with a ServerHello hundreds of bytes
+  smaller. Pairing with such a site makes the *first server packet* a
+  distinguisher, so profiles that do not negotiate `X25519MLKEM768` are rejected.
+
+Remaining gaps are in `docs/protocol/reality-transport.md`. The flight is
+*shaped* like a real handshake but is not one: a censor who runs its own Warren
+client holds a valid tag and can see there is no certificate to verify. That is
+accepted — such an adversary can enumerate bridges through discovery anyway, which
+is an L2 problem (§7.2) — and the remaining durable risk is a TLS-intercepting
+middlebox, which [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md) Stage B
+addresses if a target region deploys one.
 
 ### 6.2 Camouflage profiles are perishable (new, blocking)
 
@@ -434,6 +467,12 @@ Revised: three named regimes, client-selectable, each with a stated cost.
 | `off` | No shaping beyond the transport's own record sizes | 0% | Default for throughput-bound use (VDI, bulk) |
 | `bucket` | Payload padded to a small set of fixed sizes; no injected idle traffic | Bounded, typically <15% of carried bytes | Default for interactive browsing |
 | `cover` | `bucket` plus constant-rate cover during idle, rate-capped and duty-cycled | Explicit: a configured bytes/hour ceiling the user opts into and pays for | Only where a named local threat justifies it |
+
+The mechanism these regimes need already exists: every Warren record's plaintext
+starts with a kind byte, and filler records are discarded by the peer without ever
+reaching the caller. That is what Stage A's shaped flight is built on, so the
+shaping regimes are a policy layer over machinery that is already tested rather
+than a new wire format.
 
 Honesty requirement: `cover` raises the cost of website-fingerprinting attacks; it
 does not defeat a determined classifier, and published padding-defense results
@@ -762,7 +801,11 @@ kilobit link.
 | Payload signature DPI | ISP, state | Camouflaged transport, real-site fallback, TLS-record framing (§6.1) | Implemented |
 | Active probing | State probe infrastructure | Untagged, wrong-key, and replayed connections all receive a genuine response from the real fallback site | Implemented |
 | Stale-parrot fingerprinting | State classifier | Current uTLS profile incl. hybrid PQ key share, CI staleness check (§6.2) | Implemented (per-region selection: gap) |
-| TLS state-machine mimicry after ServerHello | Censor who holds a valid tag and watches a full session | Real-shaped ServerHello + ChangeCipherSpec + `application_data` records; a complete borrowed handshake still missing | Partial (documented) |
+| Handshake-shape classification | Passive classifier measuring record sizes | Flight shaped from a live measurement of the borrowed site, including session tickets and the client Finished size (§6.1) | Implemented, measured by `cmd/probe` |
+| Imitating a site that cannot plausibly answer | Passive classifier comparing the first server packet | Profiles that do not negotiate `X25519MLKEM768` are rejected; a relay without a usable profile refuses to serve | Implemented |
+| TCP teardown fingerprinting | Passive observer comparing how connections end | The splice mirrors an upstream reset instead of closing cleanly | Implemented |
+| Censor running its own Warren client | Adversary holding a valid tag | Nothing at L1: it can see the flight carries no verifiable certificate. Accepted — it can enumerate bridges through discovery regardless, which is §7.2's problem | Accepted gap |
+| TLS-interception by a state CA | Middlebox terminating TLS | A real session survives interception; Warren's breaks | Open ([ADR 0001](docs/adr/0001-borrowed-tls-handshake.md) Stage B) |
 | Statistical flow classification | State classifier | Shaping regimes with stated cost (§6.4) | Not started |
 | IP/ASN blocklisting | Bulk range blocking | Residential pool scale + churn (§7.1) | Not started |
 | Relay pool enumeration | Censor harvesting the pool | No global list; rotating per-requester subsets; token-rate-limited discovery (§7.2) | Design changed, not started |
@@ -873,8 +916,9 @@ predecessor's gate is met.
 - [x] Active-probe and record-shape harness (Stage 0 of [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md)),
       which immediately found two defects: a hello ~250 B short of its own
       profile, and FIN-instead-of-RST teardown. Both fixed
-- [ ] Shape-accurate server flight, so a Warren session's record sizes match a
-      real TLS 1.3 handshake's (Stage A; removes the passive distinguisher)
+- [x] Shape-accurate server flight, measured from the borrowed site rather than
+      hardcoded, carrying key confirmation; verified byte-exact against a real
+      session by `cmd/probe` (Stage A)
 - [ ] Relayed real handshake, nested inside the hybrid session — conditional on
       what the harness measures (Stage B)
 

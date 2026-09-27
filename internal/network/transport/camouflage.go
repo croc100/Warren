@@ -68,6 +68,20 @@ type Config struct {
 	// FallbackAddr is host:port for FallbackSNI (relay side only).
 	FallbackAddr string
 
+	// Flight is the borrowed site's measured record shape, from ProfileSite.
+	// Relay side, and required: without it the relay would answer its
+	// ServerHello with silence where a real server sends a kilobytes-long
+	// encrypted certificate flight, which is separable on record sizes alone.
+	// Serve refuses to start rather than serve a shape that advertises itself.
+	Flight *FlightProfile
+
+	// FlightFunc, when set, supersedes Flight and is consulted per connection.
+	// A relay re-measures its borrowed site periodically (certificates rotate,
+	// TLS stacks get reconfigured), and AtomicFlight.Load is the intended value
+	// here. If it ever returns something unusable, the relay splices that
+	// connection to the real site instead of serving a shape it cannot trust.
+	FlightFunc func() *FlightProfile
+
 	// Fingerprint selects which browser ClientHello uTLS parrots. Zero value
 	// means DefaultFingerprint.
 	//
@@ -78,6 +92,14 @@ type Config struct {
 	// so the pinned profile has to keep moving. Per-region overrides matter too
 	// — the right parrot is whatever the local population actually runs.
 	Fingerprint utls.ClientHelloID
+}
+
+// flight returns the profile this relay should imitate right now.
+func (c Config) flight() *FlightProfile {
+	if c.FlightFunc != nil {
+		return c.FlightFunc()
+	}
+	return c.Flight
 }
 
 // DefaultFingerprint is the profile used when Config.Fingerprint is unset.
@@ -226,26 +248,55 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 		return nil, err
 	}
 
-	// A real TLS 1.3 client in middlebox-compatibility mode (which is what
-	// sending a non-empty session_id signals) answers the ServerHello with a
-	// ChangeCipherSpec record before its encrypted flight. Ours does the same,
-	// so the record sequence on the wire keeps matching a genuine session.
-	if _, err := raw.Write(changeCipherSpecRecord()); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("transport: send change_cipher_spec: %w", err)
-	}
-
-	// Clear the handshake deadline: the caller's context bounded the
-	// handshake, not the lifetime of the tunnel.
-	raw.SetDeadline(time.Time{})
-
 	conn, err := newAEADConn(&bufferedConn{Conn: raw, r: br}, sessionKey, true /* isClient */)
 	if err != nil {
 		raw.Close()
 		return nil, err
 	}
+
+	// The relay now sends what a real server would: an encrypted flight the size
+	// of the borrowed site's certificate flight, with Warren's key confirmation
+	// inside the largest record. Reading it to completion before answering is
+	// what keeps the record order matching a real session — a real client's
+	// ChangeCipherSpec and Finished come after the server's flight, not before.
+	serverMAC := confirmation(sessionKey, serverConfirmLabel, clientRandom, keys.share, serverRandom, serverShare)
+	confirm, err := conn.readServerFlight(serverMAC)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+
+	// A real TLS 1.3 client in middlebox-compatibility mode (which is what
+	// sending a non-empty session_id signals) sends a ChangeCipherSpec followed
+	// by its Finished. Ours sends the same two records, the second sized to what
+	// the relay measured a real client's Finished to be against that site.
+	if _, err := raw.Write(changeCipherSpecRecord()); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: send change_cipher_spec: %w", err)
+	}
+
+	finishedLen := confirm.ClientFinishedLen
+	if finishedLen < aeadRecordOverhead+flightHeaderLen+1+minConfirmationBytes {
+		finishedLen = defaultFinishedRecordLen
+	}
+	clientMAC := confirmation(sessionKey, clientConfirmLabel, clientRandom, keys.share, serverRandom, serverShare)
+	if err := conn.writeFrame(kindConfirm, clientConfirmPayload(clientMAC, finishedLen), finishedLen); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: send client confirmation: %w", err)
+	}
+
+	// Clear the handshake deadline: the caller's context bounded the handshake,
+	// not the lifetime of the tunnel.
+	raw.SetDeadline(time.Time{})
 	return conn, nil
 }
+
+// defaultFinishedRecordLen is what a real TLS 1.3 client's Finished record
+// measures for a SHA-256 cipher suite, which is what Warren's ServerHello
+// selects: 4 bytes of handshake header, a 32-byte verify_data, one byte of inner
+// content type, and a 16-byte tag. Used only if a profile somehow carries an
+// implausible measurement.
+const defaultFinishedRecordLen = 4 + 32 + 1 + 16
 
 // Handler processes an authenticated Warren connection. Implementations own
 // the lifetime of conn and must close it when done.
@@ -257,6 +308,14 @@ type Handler func(conn net.Conn)
 // cfg.FallbackAddr so the connection completes as a genuine visit to the real
 // site.
 func Serve(ctx context.Context, ln net.Listener, cfg Config, handle Handler) error {
+	// Fail closed on a missing or implausible flight profile. A relay that
+	// cannot imitate its borrowed site's handshake is a relay that announces
+	// itself to anyone measuring record sizes, and quietly serving clients
+	// anyway would put them at more risk than not running at all.
+	if err := cfg.flight().Validate(); err != nil {
+		return err
+	}
+
 	replays := newReplayCache()
 	for {
 		raw, err := ln.Accept()
@@ -292,18 +351,14 @@ func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCac
 	// deliberately don't special-case parse errors from tag mismatches.
 	hello, recordLen, err := peekClientHello(br)
 	if err == nil {
-		serverHello, sessionKey, acceptErr := serverAccept(
-			cfg.ServerPrivateKey, hello.Random, hello.SessionId, hello.share)
+		accepted, acceptErr := serverAccept(
+			cfg.ServerPrivateKey, hello.random, hello.sessionID, hello.share)
 
-		if acceptErr == nil && replays.admit(hello.Random) {
+		flight := cfg.flight()
+		if acceptErr == nil && flight.Validate() == nil && replays.admit(hello.random) {
 			raw.SetReadDeadline(time.Now().Add(sniffTimeout))
-			err := completeHandshake(raw, br, recordLen, serverHello)
+			conn, err := completeHandshake(raw, br, recordLen, accepted, flight, hello.random, hello.share)
 			raw.SetReadDeadline(time.Time{})
-			if err != nil {
-				raw.Close()
-				return
-			}
-			conn, err := newAEADConn(&bufferedConn{Conn: raw, r: br}, sessionKey, false /* isClient */)
 			if err != nil {
 				raw.Close()
 				return
@@ -320,33 +375,72 @@ func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCac
 	spliceToFallback(ctx, raw, br, cfg.FallbackAddr)
 }
 
-// completeHandshake consumes the client's ClientHello record, sends the
-// ServerHello and a ChangeCipherSpec, and consumes the client's own
-// ChangeCipherSpec, leaving the stream positioned at the first application
-// data record.
-func completeHandshake(raw net.Conn, br *bufio.Reader, helloRecordLen int, serverHello []byte) error {
+// completeHandshake plays the relay's half of a session that has to look like a
+// real TLS 1.3 handshake: ServerHello, ChangeCipherSpec, the shaped flight
+// standing in for the certificate messages, then the client's ChangeCipherSpec
+// and Finished, then whatever the borrowed site sends afterwards (tickets).
+func completeHandshake(
+	raw net.Conn,
+	br *bufio.Reader,
+	helloRecordLen int,
+	accepted *acceptResult,
+	flight *FlightProfile,
+	clientRandom, clientShare []byte,
+) (net.Conn, error) {
 	// Consume the *entire* ClientHello record, not just the prefix we peeked:
-	// extensions and key shares still follow it on the wire and would
-	// otherwise be misread as the first application data record.
+	// extensions and key shares still follow it on the wire and would otherwise
+	// be misread as the first application data record.
 	if _, err := br.Discard(helloRecordLen); err != nil {
-		return err
+		return nil, err
 	}
-	if _, err := raw.Write(serverHello); err != nil {
-		return err
+	if _, err := raw.Write(accepted.serverHello); err != nil {
+		return nil, err
 	}
 	if _, err := raw.Write(changeCipherSpecRecord()); err != nil {
-		return err
+		return nil, err
 	}
+
+	conn, err := newAEADConn(&bufferedConn{Conn: raw, r: br}, accepted.sessionKey, false /* isClient */)
+	if err != nil {
+		return nil, err
+	}
+
+	serverMAC := confirmation(accepted.sessionKey, serverConfirmLabel,
+		clientRandom, clientShare, accepted.serverRandom, accepted.serverShare)
+	if err := conn.sendShapedFlight(flight, serverMAC); err != nil {
+		return nil, err
+	}
+
 	if _, err := readRecord(br, recordTypeChangeCipherSpec); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+
+	expected := confirmation(accepted.sessionKey, clientConfirmLabel,
+		clientRandom, clientShare, accepted.serverRandom, accepted.serverShare)
+	if err := conn.readClientConfirmation(expected); err != nil {
+		return nil, err
+	}
+
+	if err := conn.sendPostClientFlight(flight); err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
-// parsedClientHello is the parsed hello plus the hybrid key share we need.
+// parsedClientHello is the handful of ClientHello fields the relay needs, held
+// in slices it owns.
+//
+// Owning them matters: uTLS parses zero-copy, so a parsed hello points into the
+// bufio buffer the record was peeked from, and every subsequent read on that
+// reader overwrites those bytes. The tag check happens before any further read,
+// but the key confirmation in the shaped flight is computed after the client's
+// own records have come in — at which point an aliased slice holds whatever
+// arrived last. That bug is invisible in a single-round-trip test and shows up
+// as an intermittent confirmation failure under load.
 type parsedClientHello struct {
-	*utls.PubClientHelloMsg
-	share []byte
+	random    []byte
+	sessionID []byte
+	share     []byte
 }
 
 // peekClientHello reads a complete TLS record containing a ClientHello from r
@@ -381,7 +475,11 @@ func peekClientHello(r *bufio.Reader) (*parsedClientHello, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	return &parsedClientHello{PubClientHelloMsg: msg, share: share}, recordLen, nil
+	return &parsedClientHello{
+		random:    append([]byte(nil), msg.Random...),
+		sessionID: append([]byte(nil), msg.SessionId...),
+		share:     append([]byte(nil), share...),
+	}, recordLen, nil
 }
 
 func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallbackAddr string) {

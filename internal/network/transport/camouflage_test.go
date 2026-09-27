@@ -41,6 +41,23 @@ func startFallbackEcho(t *testing.T) string {
 // fallback site, and returns its address plus the client-side Config a genuine
 // Warren client would hold (the relay's *public* key only — clients never see
 // the identity key, which is the point of replacing the shared PSK).
+// testFlight is a stand-in for a real measurement, using the record shape an
+// OpenSSL-backed site actually produced when profiled: a small
+// EncryptedExtensions record, a certificate-sized one, a CertificateVerify, a
+// Finished, and two session tickets afterwards.
+func testFlight() *FlightProfile {
+	return &FlightProfile{
+		Site:              "127.0.0.1:0",
+		SNI:               "www.example.com",
+		Group:             uint16(utls.X25519MLKEM768),
+		ServerHelloLen:    1210,
+		ServerFlight:      []ShapedRecord{{Len: 27}, {Len: 823}, {Len: 281}, {Len: 69}},
+		PostClientFlight:  []ShapedRecord{{Len: 250}, {Len: 250}},
+		ClientFinishedLen: 69,
+		SampledAt:         time.Now(),
+	}
+}
+
 func startRelay(t *testing.T, handle Handler) (addr string, clientCfg Config) {
 	t.Helper()
 	priv, pub, err := GenerateServerIdentity()
@@ -61,6 +78,7 @@ func startRelay(t *testing.T, handle Handler) (addr string, clientCfg Config) {
 		ServerPrivateKey: priv,
 		FallbackSNI:      "www.example.com",
 		FallbackAddr:     startFallbackEcho(t),
+		Flight:           testFlight(),
 	}
 	go Serve(ctx, ln, relayCfg, handle)
 
@@ -323,15 +341,15 @@ func TestEphemeralSecretsDifferPerConnection(t *testing.T) {
 	sessionID := make([]byte, sessionIDLen)
 	copy(sessionID, deriveTag(first.authSS, clientRandom, first.share))
 
-	_, keyA, err := serverAccept(priv, clientRandom, sessionID, first.share)
+	acceptA, err := serverAccept(priv, clientRandom, sessionID, first.share)
 	if err != nil {
 		t.Fatalf("serverAccept: %v", err)
 	}
-	_, keyB, err := serverAccept(priv, clientRandom, sessionID, first.share)
+	acceptB, err := serverAccept(priv, clientRandom, sessionID, first.share)
 	if err != nil {
 		t.Fatalf("serverAccept: %v", err)
 	}
-	if bytes.Equal(keyA, keyB) {
+	if bytes.Equal(acceptA.sessionKey, acceptB.sessionKey) {
 		t.Fatal("the relay derived the same session key twice for identical client input; its ephemeral half is not ephemeral")
 	}
 
@@ -339,7 +357,7 @@ func TestEphemeralSecretsDifferPerConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate identity: %v", err)
 	}
-	if _, _, err := serverAccept(otherPriv, clientRandom, sessionID, first.share); err == nil {
+	if _, err := serverAccept(otherPriv, clientRandom, sessionID, first.share); err == nil {
 		t.Fatal("a relay holding a different identity key validated the tag")
 	}
 }
@@ -533,6 +551,7 @@ func TestSpliceMirrorsUpstreamReset(t *testing.T) {
 		ServerPrivateKey: priv,
 		FallbackSNI:      "www.example.com",
 		FallbackAddr:     site.Addr().String(),
+		Flight:           testFlight(),
 	}, func(conn net.Conn) { conn.Close() })
 
 	conn, err := net.Dial("tcp", ln.Addr().String())

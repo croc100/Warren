@@ -313,6 +313,20 @@ func Compare(warren, real Trace) Report {
 		Note:          "both should carry a hybrid post-quantum key share; the profile's own size band is ~100 B wide",
 	})
 
+	// Session tickets: a real server sends them right after the client's
+	// Finished, and a peer that skips them is separable a few records later than
+	// the certificate flight would have given it away.
+	wPost, wPostRecords := serverRecordsAfterClientFinished(warren)
+	rPost, rPostRecords := serverRecordsAfterClientFinished(real)
+	postTolerance := max(float64(flightAbsoluteTolerance), float64(rPost)*flightRelativeTolerance)
+	r.Findings = append(r.Findings, Finding{
+		Name:          "post-handshake server records",
+		Warren:        fmt.Sprintf("%d B in %d records", wPost, wPostRecords),
+		Real:          fmt.Sprintf("%d B in %d records", rPost, rPostRecords),
+		Distinguisher: absDiff(wPost, rPost) > int(postTolerance),
+		Note:          "session tickets, in practice",
+	})
+
 	wSH, rSH := firstRecordLen(warren, FromServer), firstRecordLen(real, FromServer)
 	r.Findings = append(r.Findings, Finding{
 		Name:          "ServerHello size",
@@ -340,6 +354,26 @@ func serverFlightAfterCCS(t Trace) (bytes, records int) {
 			break
 		}
 		if rec.Dir == FromServer {
+			bytes += rec.Len
+			records++
+		}
+	}
+	return bytes, records
+}
+
+// serverRecordsAfterClientFinished totals what the server sends once the client
+// has confirmed the handshake, up to the client's first payload record.
+func serverRecordsAfterClientFinished(t Trace) (bytes, records int) {
+	seenClientFinished := false
+	for _, rec := range t.Records {
+		if rec.Dir == FromClient && rec.Type == TypeApplicationData {
+			if seenClientFinished {
+				break // the client's second app record is its payload
+			}
+			seenClientFinished = true
+			continue
+		}
+		if seenClientFinished && rec.Dir == FromServer {
 			bytes += rec.Len
 			records++
 		}
