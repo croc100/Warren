@@ -23,24 +23,27 @@ func main() {
 	bridgeFile := flag.String("bridge-file", "", "path to a locally-distributed bridge list (out-of-band channel)")
 	fallbackSNI := flag.String("fallback-sni", "", "override: hostname to present in the disguised ClientHello (required if not using -bridge-file)")
 	addr := flag.String("addr", "", "override: bridge host:port to dial directly (required if not using -bridge-file)")
+	relayKey := flag.String("relay-key", "", "override: the bridge's X25519 public key (64 hex chars); defaults to WARREN_RELAY_PUBKEY_HEX")
 	message := flag.String("message", "hello from a censored network", "test message to echo through the bridge")
 	flag.Parse()
-
-	psk, err := loadPSK()
-	if err != nil {
-		log.Fatalf("cli: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	bridge, err := resolveBridge(ctx, *bridgeFile, *addr, *fallbackSNI)
+	bridge, err := resolveBridge(ctx, *bridgeFile, *addr, *fallbackSNI, *relayKey)
 	if err != nil {
 		log.Fatalf("cli: %v", err)
 	}
+	publicKey, err := hex.DecodeString(bridge.PublicKeyHex)
+	if err != nil || len(publicKey) != 32 {
+		log.Fatalf("cli: bridge public key must be 64 hex chars (got %q)", bridge.PublicKeyHex)
+	}
 	log.Printf("cli: dialing bridge %s (camouflaged as %s)", bridge.Addr, bridge.FallbackSNI)
 
-	conn, err := transport.Dial(ctx, bridge.Addr, transport.Config{PSK: psk, FallbackSNI: bridge.FallbackSNI})
+	conn, err := transport.Dial(ctx, bridge.Addr, transport.Config{
+		ServerPublicKey: publicKey,
+		FallbackSNI:     bridge.FallbackSNI,
+	})
 	if err != nil {
 		log.Fatalf("cli: dial: %v", err)
 	}
@@ -57,9 +60,12 @@ func main() {
 	fmt.Printf("echoed back: %s\n", buf)
 }
 
-func resolveBridge(ctx context.Context, bridgeFile, addr, sni string) (bootstrap.Bridge, error) {
+func resolveBridge(ctx context.Context, bridgeFile, addr, sni, relayKey string) (bootstrap.Bridge, error) {
+	if relayKey == "" {
+		relayKey = os.Getenv("WARREN_RELAY_PUBKEY_HEX")
+	}
 	if addr != "" && sni != "" {
-		return bootstrap.Bridge{Addr: addr, FallbackSNI: sni}, nil
+		return bootstrap.Bridge{Addr: addr, FallbackSNI: sni, PublicKeyHex: relayKey}, nil
 	}
 	if bridgeFile == "" {
 		return bootstrap.Bridge{}, fmt.Errorf("must pass either -bridge-file or both -addr and -fallback-sni")
@@ -75,19 +81,4 @@ func resolveBridge(ctx context.Context, bridgeFile, addr, sni string) (bootstrap
 		return bootstrap.Bridge{}, err
 	}
 	return bridges[0], nil
-}
-
-func loadPSK() ([]byte, error) {
-	env := os.Getenv("WARREN_PSK_HEX")
-	if env == "" {
-		return nil, fmt.Errorf("no PSK provided: set WARREN_PSK_HEX (64 hex chars)")
-	}
-	psk, err := hex.DecodeString(env)
-	if err != nil {
-		return nil, fmt.Errorf("WARREN_PSK_HEX: %w", err)
-	}
-	if len(psk) != 32 {
-		return nil, fmt.Errorf("WARREN_PSK_HEX must decode to 32 bytes, got %d", len(psk))
-	}
-	return psk, nil
 }

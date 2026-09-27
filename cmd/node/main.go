@@ -2,7 +2,7 @@
 // connections (internal/network/transport), echoes application data back to
 // authenticated Warren clients, and transparently splices anything else to a
 // real fallback site. This is the L0+L1 proof of concept — no marketplace,
-// payment, or ZK auth wired in yet.
+// payment, or exit policy wired in yet.
 package main
 
 import (
@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/croc100/warren/internal/network/transport"
@@ -23,15 +24,27 @@ func main() {
 	listenAddr := flag.String("listen", "127.0.0.1:8443", "address to accept connections on")
 	fallbackAddr := flag.String("fallback-addr", "", "real host:port to splice non-Warren connections to (required)")
 	fallbackSNI := flag.String("fallback-sni", "", "hostname the disguised ClientHello claims to be (required)")
-	pskFile := flag.String("psk-file", "", "path to a file containing the pre-shared key (32 raw bytes); if empty, reads WARREN_PSK_HEX env var")
+	keyFile := flag.String("identity-file", "", "path to a file containing this relay's X25519 identity key (64 hex chars); if empty, reads WARREN_RELAY_KEY_HEX")
+	genKey := flag.Bool("genkey", false, "generate a relay identity key pair, print it, and exit")
 	flag.Parse()
 
+	if *genKey {
+		priv, pub, err := transport.GenerateServerIdentity()
+		if err != nil {
+			log.Fatalf("node: %v", err)
+		}
+		fmt.Printf("WARREN_RELAY_KEY_HEX=%s\n", hex.EncodeToString(priv))
+		fmt.Printf("relay public key (publish this with the bridge address): %s\n", hex.EncodeToString(pub))
+		return
+	}
+
 	if *fallbackAddr == "" || *fallbackSNI == "" {
-		fmt.Fprintln(os.Stderr, "usage: node -fallback-addr=host:port -fallback-sni=example.com [-psk-file=path]")
+		fmt.Fprintln(os.Stderr, "usage: node -fallback-addr=host:port -fallback-sni=example.com [-identity-file=path]")
+		fmt.Fprintln(os.Stderr, "       node -genkey")
 		os.Exit(2)
 	}
 
-	psk, err := loadPSK(*pskFile)
+	identity, err := loadIdentity(*keyFile)
 	if err != nil {
 		log.Fatalf("node: %v", err)
 	}
@@ -45,7 +58,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg := transport.Config{PSK: psk, FallbackSNI: *fallbackSNI, FallbackAddr: *fallbackAddr}
+	cfg := transport.Config{ServerPrivateKey: identity, FallbackSNI: *fallbackSNI, FallbackAddr: *fallbackAddr}
 
 	go func() {
 		<-ctx.Done()
@@ -73,27 +86,30 @@ func main() {
 	}
 }
 
-func loadPSK(path string) ([]byte, error) {
+// loadIdentity reads the relay's long-term X25519 private key. Unlike the
+// pre-shared key this replaced, it is never distributed to clients: clients
+// only ever see the corresponding public key, so a compromised client cannot
+// impersonate the relay or read another client's session.
+func loadIdentity(path string) ([]byte, error) {
+	encoded := os.Getenv("WARREN_RELAY_KEY_HEX")
+	source := "WARREN_RELAY_KEY_HEX"
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read psk file: %w", err)
+			return nil, fmt.Errorf("read identity file: %w", err)
 		}
-		if len(data) < 32 {
-			return nil, fmt.Errorf("psk file must contain at least 32 bytes, got %d", len(data))
-		}
-		return data[:32], nil
+		encoded, source = string(data), path
 	}
-	env := os.Getenv("WARREN_PSK_HEX")
-	if env == "" {
-		return nil, fmt.Errorf("no PSK provided: pass -psk-file or set WARREN_PSK_HEX (64 hex chars)")
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
+		return nil, fmt.Errorf("no relay identity provided: pass -identity-file or set WARREN_RELAY_KEY_HEX (generate one with -genkey)")
 	}
-	psk, err := hex.DecodeString(env)
+	key, err := hex.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("WARREN_PSK_HEX: %w", err)
+		return nil, fmt.Errorf("%s: %w", source, err)
 	}
-	if len(psk) != 32 {
-		return nil, fmt.Errorf("WARREN_PSK_HEX must decode to 32 bytes, got %d", len(psk))
+	if len(key) != 32 {
+		return nil, fmt.Errorf("%s must decode to 32 bytes, got %d", source, len(key))
 	}
-	return psk, nil
+	return key, nil
 }

@@ -3,8 +3,8 @@
 **The network layer for the CRODE no-log line: Crovi, Thump, and Lumra.**
 
 > **Status: pre-alpha.** Two layers work today — multi-channel bridge discovery and
-> a camouflaged TLS transport proof of concept (~1,100 lines of Go). Everything
-> else in this README is design, not shipped code. The honest breakdown is in
+> a camouflaged TLS transport with a hybrid post-quantum session handshake
+> (~1,700 lines of Go). Everything else in this README is design, not shipped code. The honest breakdown is in
 > [`DESIGN.md` §0](DESIGN.md#0-implementation-status); the ordered plan with
 > falsifiable gates is in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
@@ -20,8 +20,9 @@ state-scale adversary.**
 |---------|-----------------|
 | Exit IPs get blocklisted within days | Relay pool of ordinary residential nodes, churning, non-enumerable — blocking cost scales with households, not with VPN companies |
 | DPI signature matching and active probing | Camouflaged transport: an unauthenticated connection gets a genuine response from a real site, because a real site actually answered it |
-| Statistical flow classification | Current browser fingerprint (incl. hybrid post-quantum key share) + costed traffic-shaping regimes |
+| Statistical flow classification | Current browser fingerprint (incl. hybrid post-quantum key share), TLS-shaped records + costed traffic-shaping regimes |
 | Discovery endpoints get blocked | Multi-channel bootstrap (DoH/DNS TXT, out-of-band bridge lists, compiled-in fallback), no central bridge API |
+| Traffic recorded now, decrypted later | Hybrid X25519 + ML-KEM-768 session keys, forward secret per connection |
 | Allowlist regimes and shutdowns | An explicit degradation ladder down to mesh-only and offline — and a plain statement of where it ends |
 
 What Warren is **not**: an anonymity network (no protection against an adversary
@@ -43,28 +44,34 @@ Run the camouflage demo — a relay that borrows a real site's identity, a genui
 client, and a probe that gets the real site instead:
 
 ```bash
-export WARREN_PSK_HEX=$(openssl rand -hex 32)   # both sides share this
+# 1. the relay's identity key pair (the private half never leaves the relay)
+go run ./cmd/node -genkey
 
-# 1. a stand-in "real site" the relay borrows an identity from
+# 2. a stand-in "real site" the relay borrows an identity from
 python3 -m http.server 9443
 
-# 2. the relay
-go run ./cmd/node -listen=127.0.0.1:8443 \
+# 3. the relay
+WARREN_RELAY_KEY_HEX=<private half> go run ./cmd/node -listen=127.0.0.1:8443 \
   -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 
-# 3. a genuine Warren client
-go run ./cmd/cli -addr=127.0.0.1:8443 -fallback-sni=www.example.com \
-  -message="hello from behind the firewall"
+# 4. a bridge descriptor, as an out-of-band channel would distribute it
+echo "127.0.0.1:8443|www.example.com|<public half>" > bridges.txt
+
+# 5. a genuine Warren client
+go run ./cmd/cli -bridge-file=bridges.txt -message="hello from behind the firewall"
 ```
 
 Then act like a censor's probe: `curl -v --http1.0 http://127.0.0.1:8443/` gets a
-real response from whatever is on `-fallback-addr`, with nothing to flag.
+real response from whatever is on `-fallback-addr`, with nothing to flag. A client
+holding the wrong relay key gets the same treatment, and so does a replayed
+ClientHello.
 Details and known gaps: [`docs/protocol/reality-transport.md`](docs/protocol/reality-transport.md).
 
 | Component | Path | State |
 |-----------|------|-------|
 | Bridge discovery (DNS TXT / file / static, partial-failure tolerant) | `internal/discovery/bootstrap` | Implemented + tested |
-| Camouflaged transport (tagged ClientHello, real-site fallback, AEAD framing) | `internal/network/transport` | PoC, tested, documented gaps |
+| Camouflaged transport (tagged ClientHello, real-site fallback, TLS-record framing) | `internal/network/transport` | Tested, documented gaps |
+| Session handshake (X25519 + ML-KEM-768 hybrid, forward secret, replay-protected) | `internal/network/transport` | Tested |
 | Relay pool, routing, reputation, exit policy | — | Not started |
 | Accounting / settlement | `contracts/` (sketches, never deployed) | Not started |
 | Measurement | — | Not started |

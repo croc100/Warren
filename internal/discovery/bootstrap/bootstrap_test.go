@@ -9,11 +9,11 @@ import (
 )
 
 func TestParseBridge(t *testing.T) {
-	b, err := ParseBridge("203.0.113.5:443|www.example.com")
+	b, err := ParseBridge("203.0.113.5:443|www.example.com|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if b.Addr != "203.0.113.5:443" || b.FallbackSNI != "www.example.com" {
+	if b.Addr != "203.0.113.5:443" || b.FallbackSNI != "www.example.com" || b.PublicKeyHex != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("got %+v", b)
 	}
 	if _, err := ParseBridge("not-a-valid-line"); err == nil {
@@ -24,7 +24,7 @@ func TestParseBridge(t *testing.T) {
 func TestFileResolver_SkipsMalformedLinesButKeepsGood(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bridges.txt")
-	content := "# comment\n\n203.0.113.5:443|www.example.com\ngarbage-line\n198.51.100.9:8443|cdn.example.net\n"
+	content := "# comment\n\n203.0.113.5:443|www.example.com|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ngarbage-line\n203.0.113.9:443|no.key.example.net\n198.51.100.9:8443|cdn.example.net|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -50,9 +50,9 @@ func TestDNSResolver_ParsesTXTRecords(t *testing.T) {
 		Domain: "_warren-bridges.example.org",
 		LookupTXT: func(ctx context.Context, name string) ([]string, error) {
 			return []string{
-				"203.0.113.5:443|www.example.com",
+				"203.0.113.5:443|www.example.com|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				"not-valid",
-				"198.51.100.9:8443|cdn.example.net",
+				"198.51.100.9:8443|cdn.example.net|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			}, nil
 		},
 	}
@@ -92,7 +92,7 @@ func TestMulti_SurvivesPartialChannelFailure(t *testing.T) {
 	workingDNS := DNSResolver{
 		Domain: "_warren-bridges.working.example",
 		LookupTXT: func(ctx context.Context, name string) ([]string, error) {
-			return []string{"203.0.113.5:443|www.example.com"}, nil
+			return []string{"203.0.113.5:443|www.example.com|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, nil
 		},
 	}
 	static := StaticResolver{Bridges: []Bridge{

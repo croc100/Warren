@@ -1,41 +1,42 @@
 // Package transport implements Warren's L1 protocol camouflage layer.
 //
-// This is a "REALITY-lite" scheme: a Warren client's first packet is a
-// syntactically valid TLS 1.3 ClientHello (built with uTLS so it carries a
-// current browser's fingerprint, including the hybrid post-quantum key share
-// mainstream browsers now offer by default) addressed to a real,
-// currently-reachable HTTPS site. A 16-byte authentication tag is embedded in the ClientHello's
-// session_id field, derived from a pre-shared key (PSK) and the ClientHello's
-// own random field.
+// A Warren client's first packet is a syntactically valid TLS 1.3 ClientHello
+// (built with uTLS so it carries a current browser's fingerprint, including the
+// hybrid post-quantum key share mainstream browsers now offer by default)
+// addressed to a real, currently-reachable HTTPS site. Two things ride inside
+// that hello:
 //
-// The server peeks the first TLS record on every inbound connection:
-//   - tag valid  -> this is a genuine Warren client. Both sides independently
-//     derive a session key from (PSK, client_random) and switch immediately
-//     to Warren's own AEAD-framed protocol on the same TCP stream.
-//   - tag invalid/absent -> the connection is spliced byte-for-byte to the
-//     real site the ClientHello's SNI names. A censor's active probe (or any
-//     passive DPI classifier) sees a completely genuine handshake with the
-//     real site's real certificate, because it *is* one.
+//   - a 16-byte authentication tag in the session_id field, derived from an
+//     X25519 exchange between the client's ephemeral key and the relay's
+//     long-term identity key — so only the intended relay can recognize it, and
+//     no shared secret is distributed to clients;
+//   - the client's own ephemeral X25519MLKEM768 key share, in the exact wire
+//     format a real browser uses for that group.
 //
-// Known gap vs. full REALITY (xtls/xray-core's `reality` package): real
-// REALITY derives its authentication key from an X25519 exchange embedded in
-// the TLS key_share extension, so there is no long-lived shared secret to
-// leak or rotate, and post-ClientHello bytes remain valid TLS 1.3 handshake
-// records throughout. This package uses a simpler static PSK and switches to
-// Warren's own framing immediately after the ClientHello, which is easier to
-// reason about and test, but weaker against key compromise and against a
-// censor that verifies TLS 1.3 state machine ordering off the first
-// connection, not just the first packet. Treat this as the buildable proof
-// of concept for the tag+fallback mechanism, not the hardened production
-// transport — see docs/protocol/reality-transport.md for the migration path.
+// The relay peeks the first TLS record on every inbound connection:
+//   - tag valid  -> a genuine Warren client. The relay answers with a
+//     real-shaped TLS 1.3 ServerHello carrying the ML-KEM ciphertext, and both
+//     sides derive the session key from ML-KEM + ephemeral X25519 + the
+//     identity exchange (see handshake.go). Application data then flows in
+//     records shaped like TLS application_data.
+//   - tag invalid, absent, or replayed -> the connection is spliced
+//     byte-for-byte to the real site the ClientHello's SNI names. A censor's
+//     active probe (or any passive DPI classifier) sees a completely genuine
+//     handshake with the real site's real certificate, because it *is* one.
+//
+// Known gap vs. full REALITY (xtls/xray-core's `reality` package): a genuine
+// Warren session's second flight is shaped like TLS 1.3 but is not a real TLS
+// handshake — there is no Certificate/Finished a probe holding a valid tag
+// could verify, and Warren's own AEAD keys protect the session instead. Full
+// REALITY keeps the borrowed site's real handshake all the way through. Closing
+// that gap is tracked in docs/protocol/reality-transport.md; what this package
+// does close is the static-PSK weakness (there is no longer a shared secret to
+// leak) and the absence of post-quantum protection for recorded sessions.
 package transport
 
 import (
 	"bufio"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -43,33 +44,26 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/crypto/hkdf"
 )
 
-const (
-	tagLen                 = 16
-	sessionIDLen           = 32                                                                               // matches typical Chrome TLS 1.3 ClientHello session_id length
-	clientHelloFixedPrefix = 5 /*record header*/ + 4 /*handshake header*/ + 2 /*version*/ + 32 /*random*/ + 1 /*session_id len byte*/
-)
-
-var (
-	ErrNotClientHello = errors.New("transport: first record is not a TLS ClientHello")
-	ErrShortRead      = errors.New("transport: connection closed before ClientHello was fully read")
-)
-
-// Config holds the parameters both a camouflage client and server need.
+// Config holds the parameters a camouflage client and relay need. A client
+// needs ServerPublicKey; a relay needs ServerPrivateKey and FallbackAddr.
 type Config struct {
-	// PSK is the pre-shared key used to derive per-connection tags and
-	// session keys. In production this should be rotated and distributed
-	// over the same out-of-band bootstrap channel as bridge addresses.
-	PSK []byte
+	// ServerPublicKey is the relay's long-term X25519 public key (32 bytes),
+	// distributed alongside its address in the bridge descriptor. Client side.
+	ServerPublicKey []byte
+
+	// ServerPrivateKey is the relay's long-term X25519 private key (32
+	// bytes), generated by GenerateServerIdentity. Relay side; never leaves
+	// the relay and never reaches a client.
+	ServerPrivateKey []byte
 
 	// FallbackSNI is the hostname the disguised ClientHello claims to be
-	// visiting. The server dials this host for real when a connection's
-	// tag doesn't validate.
+	// visiting. The relay dials this host for real when a connection's tag
+	// doesn't validate.
 	FallbackSNI string
 
-	// FallbackAddr is host:port for FallbackSNI (server-side only).
+	// FallbackAddr is host:port for FallbackSNI (relay side only).
 	FallbackAddr string
 
 	// Fingerprint selects which browser ClientHello uTLS parrots. Zero value
@@ -91,78 +85,24 @@ type Config struct {
 // property that actually matters if this is ever pinned to a fixed version.
 var DefaultFingerprint = utls.HelloChrome_Auto
 
-func deriveTag(psk, clientRandom []byte) []byte {
-	mac := hmac.New(sha256.New, psk)
-	mac.Write(clientRandom)
-	return mac.Sum(nil)[:tagLen]
-}
-
-func deriveSessionKey(psk, clientRandom []byte) ([]byte, error) {
-	h := hkdf.New(sha256.New, psk, clientRandom, []byte("warren-lite-v1"))
-	key := make([]byte, 32)
-	if _, err := io.ReadFull(h, key); err != nil {
+// Dial opens a camouflaged connection to addr. On success the returned net.Conn
+// transparently encrypts and decrypts application data under a session key both
+// sides derived from the hybrid handshake; the caller does not need to know any
+// of this happened.
+func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
+	keys, err := newClientKeys(cfg.ServerPublicKey)
+	if err != nil {
 		return nil, err
 	}
-	return key, nil
-}
 
-// clientHello is the subset of a parsed TLS 1.3 ClientHello we need.
-type clientHello struct {
-	raw          []byte // prefix through session_id only — enough to read the tag
-	recordLen    int    // full on-wire length of the TLS record (header + body)
-	clientRandom []byte
-	sessionIDOff int // offset of the session_id bytes within raw
-}
-
-// peekClientHello reads (without consuming beyond what's needed) a single
-// TLS record containing a ClientHello from r, returning the raw bytes and
-// the offsets of the fields we care about. Offsets are fixed by the TLS 1.2+
-// wire format up through session_id, so no general ASN.1/TLS parser is
-// needed for this subset.
-func peekClientHello(r *bufio.Reader) (*clientHello, error) {
-	head, err := r.Peek(clientHelloFixedPrefix)
-	if err != nil {
-		return nil, ErrShortRead
-	}
-	if head[0] != 0x16 /* handshake */ || head[5] != 0x01 /* client_hello */ {
-		return nil, ErrNotClientHello
-	}
-	// TLS record length (bytes 3-4 of the record header) covers everything
-	// after the 5-byte record header — this is the full on-wire size we
-	// must eventually discard, not just the prefix we peek here.
-	recordBodyLen := int(head[3])<<8 | int(head[4])
-	recordLen := 5 + recordBodyLen
-
-	sessionIDLenByte := int(head[clientHelloFixedPrefix-1])
-	total := clientHelloFixedPrefix + sessionIDLenByte
-	if total > recordLen {
-		return nil, ErrNotClientHello
-	}
-	full, err := r.Peek(total)
-	if err != nil {
-		return nil, ErrShortRead
-	}
-	raw := make([]byte, len(full))
-	copy(raw, full)
-
-	const randomOff = 5 /*record*/ + 4 /*handshake*/ + 2 /*client_version*/
-	return &clientHello{
-		raw:          raw,
-		recordLen:    recordLen,
-		clientRandom: raw[randomOff : randomOff+32],
-		sessionIDOff: clientHelloFixedPrefix,
-	}, nil
-}
-
-// Dial opens a camouflaged connection to addr. On success the returned
-// net.Conn transparently encrypts/decrypts application data with a session
-// key both sides derive from cfg.PSK; the caller does not need to know this
-// happened.
-func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 	d := net.Dialer{}
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: dial %s: %w", addr, err)
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		raw.SetDeadline(deadline)
 	}
 
 	fingerprint := cfg.Fingerprint
@@ -179,42 +119,114 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 	hello := uconn.HandshakeState.Hello
 	clientRandom := append([]byte(nil), hello.Random...)
 
-	tag := deriveTag(cfg.PSK, clientRandom)
+	// Swap our own ephemeral keys into the hybrid key share. Same group, same
+	// length, same structure as what uTLS generated, so the hello's shape is
+	// untouched — only the bytes are ours, and only we hold the private halves.
+	replaced := false
+	for i := range hello.KeyShares {
+		if hello.KeyShares[i].Group == utls.X25519MLKEM768 {
+			hello.KeyShares[i].Data = keys.share
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		raw.Close()
+		return nil, fmt.Errorf("%w: fingerprint %v offers no hybrid group to hide the handshake in", ErrNoHybridShare, fingerprint)
+	}
+
 	sessionID := make([]byte, sessionIDLen)
-	copy(sessionID, tag)
-	if _, err := rand.Read(sessionID[tagLen:]); err != nil {
+	copy(sessionID, deriveTag(keys.authSS, clientRandom, keys.share))
+	if _, err := io.ReadFull(randReader, sessionID[tagLen:]); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("transport: fill session id padding: %w", err)
 	}
 	hello.SessionId = sessionID
+
 	// uTLS caches the originally-built wire bytes in hello.Raw and Marshal
 	// returns that cache verbatim whenever it's non-nil — it does NOT
 	// re-encode from the struct fields by default. Since we just mutated
-	// SessionId, the cache is stale; clearing Raw forces Marshal to
-	// actually re-serialize, picking up our patched SessionId while
-	// everything else (extension order, cipher list, key shares, ALPN — the
-	// fingerprint proper) still matches what uTLS built for the parroted
-	// browser profile.
+	// SessionId and KeyShares, the cache is stale; clearing Raw forces Marshal
+	// to actually re-serialize, picking up our patched fields while everything
+	// else (extension order, cipher list, ALPN — the fingerprint proper) still
+	// matches what uTLS built for the parroted browser profile.
 	hello.Raw = nil
 	rawHello, err := hello.Marshal()
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("transport: marshal client hello: %w", err)
 	}
-	record := append([]byte{0x16, 0x03, 0x01, byte(len(rawHello) >> 8), byte(len(rawHello))}, rawHello...)
 
+	record := make([]byte, 0, 5+len(rawHello))
+	record = append(record, recordTypeHandshake, 0x03, 0x01) // legacy record version, as Chrome sends
+	record = appendUint16(record, uint16(len(rawHello)))
+	record = append(record, rawHello...)
 	if _, err := raw.Write(record); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("transport: send client hello: %w", err)
 	}
 
-	sessionKey, err := deriveSessionKey(cfg.PSK, clientRandom)
+	br := bufio.NewReaderSize(raw, maxRecordLen+recordHeaderLen)
+	serverHello, err := readRecord(br, recordTypeHandshake)
+	if err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: read server hello: %w", err)
+	}
+	serverRandom, serverShare, err := parseServerHello(serverHello)
 	if err != nil {
 		raw.Close()
 		return nil, err
 	}
 
-	return newAEADConn(raw, sessionKey, true /* isClient */)
+	// A real TLS 1.3 server in middlebox-compatibility mode follows its
+	// ServerHello with a ChangeCipherSpec record, so ours does too — and the
+	// client has to consume it before application data starts.
+	if _, err := readRecord(br, recordTypeChangeCipherSpec); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: read change_cipher_spec: %w", err)
+	}
+
+	mlkemSS, err := keys.mlkemDK.Decapsulate(serverShare[:mlkemCiphertextLen])
+	if err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: decapsulate: %w", err)
+	}
+	serverECDHE, err := ecdhX25519PublicKey(serverShare[mlkemCiphertextLen:])
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	ecdheSS, err := keys.ecdhe.ECDH(serverECDHE)
+	if err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: ephemeral ecdh: %w", err)
+	}
+
+	sessionKey, err := deriveSessionKey(mlkemSS, ecdheSS, keys.authSS, clientRandom, serverRandom, keys.share, serverShare)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+
+	// A real TLS 1.3 client in middlebox-compatibility mode (which is what
+	// sending a non-empty session_id signals) answers the ServerHello with a
+	// ChangeCipherSpec record before its encrypted flight. Ours does the same,
+	// so the record sequence on the wire keeps matching a genuine session.
+	if _, err := raw.Write(changeCipherSpecRecord()); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("transport: send change_cipher_spec: %w", err)
+	}
+
+	// Clear the handshake deadline: the caller's context bounded the
+	// handshake, not the lifetime of the tunnel.
+	raw.SetDeadline(time.Time{})
+
+	conn, err := newAEADConn(&bufferedConn{Conn: raw, r: br}, sessionKey, true /* isClient */)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 // Handler processes an authenticated Warren connection. Implementations own
@@ -222,10 +234,12 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 type Handler func(conn net.Conn)
 
 // Serve accepts connections on ln, validating each one's embedded tag. Valid
-// connections are handed to handle over an AEAD-framed net.Conn; invalid or
-// absent tags cause the raw bytes to be spliced to cfg.FallbackAddr so the
-// connection completes as a genuine visit to the real site.
+// connections are handed to handle over an AEAD-framed net.Conn; invalid,
+// absent, or replayed tags cause the raw bytes to be spliced to
+// cfg.FallbackAddr so the connection completes as a genuine visit to the real
+// site.
 func Serve(ctx context.Context, ln net.Listener, cfg Config, handle Handler) error {
+	replays := newReplayCache()
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
@@ -234,49 +248,44 @@ func Serve(ctx context.Context, ln net.Listener, cfg Config, handle Handler) err
 			}
 			return err
 		}
-		go serveConn(ctx, raw, cfg, handle)
+		go serveConn(ctx, raw, cfg, replays, handle)
 	}
 }
 
 // sniffTimeout bounds how long we'll wait for a complete ClientHello before
-// giving up. Without this, a connection that sends a plausible record/
-// handshake header claiming a large session_id but never sends the rest
-// would block its serveConn goroutine forever (a cheap Slowloris-style
-// resource exhaustion — one dangling TCP connection per idle goroutine).
+// giving up. Without this, a connection that sends a plausible record header
+// claiming a large record but never sends the rest would block its serveConn
+// goroutine forever (a cheap Slowloris-style resource exhaustion — one
+// dangling TCP connection per idle goroutine).
+//
+// It has to accommodate a legitimate hybrid ClientHello, which is ~1.5 KB and
+// therefore arrives across several TCP segments rather than in one.
 const sniffTimeout = 5 * time.Second
 
-func serveConn(ctx context.Context, raw net.Conn, cfg Config, handle Handler) {
-	br := bufio.NewReaderSize(raw, 4096)
+func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCache, handle Handler) {
+	br := bufio.NewReaderSize(raw, maxRecordLen+recordHeaderLen)
 
 	raw.SetReadDeadline(time.Now().Add(sniffTimeout))
 
-	// Any failure below — malformed record, short read, tag mismatch — is
-	// treated identically: fall through to the fallback splice. Closing the
+	// Any failure below — malformed record, short read, tag mismatch, replay —
+	// is treated identically: fall through to the fallback splice. Closing the
 	// connection instead on a parse failure would itself be a distinguishing
 	// signal (a real HTTPS server doesn't instantly RST on odd input), so we
 	// deliberately don't special-case parse errors from tag mismatches.
-	hello, err := peekClientHello(br)
-	raw.SetReadDeadline(time.Time{}) // clear the sniff deadline either way
+	hello, recordLen, err := peekClientHello(br)
 	if err == nil {
-		expected := deriveTag(cfg.PSK, hello.clientRandom)
-		got := hello.raw[hello.sessionIDOff : hello.sessionIDOff+tagLen]
+		serverHello, sessionKey, acceptErr := serverAccept(
+			cfg.ServerPrivateKey, hello.Random, hello.SessionId, hello.share)
 
-		if hmac.Equal(expected, got) {
-			// Genuine Warren client. Consume the *entire* ClientHello
-			// record (not just the prefix we peeked to read the tag —
-			// extensions/cipher suites/etc. still follow it on the wire),
-			// then switch to AEAD framing for everything after.
-			if _, err := br.Discard(hello.recordLen); err != nil {
-				raw.Close()
-				return
-			}
-			sessionKey, err := deriveSessionKey(cfg.PSK, hello.clientRandom)
+		if acceptErr == nil && replays.admit(hello.Random) {
+			raw.SetReadDeadline(time.Now().Add(sniffTimeout))
+			err := completeHandshake(raw, br, recordLen, serverHello)
+			raw.SetReadDeadline(time.Time{})
 			if err != nil {
 				raw.Close()
 				return
 			}
-			wrapped := &bufferedConn{Conn: raw, r: br}
-			conn, err := newAEADConn(wrapped, sessionKey, false /* isClient */)
+			conn, err := newAEADConn(&bufferedConn{Conn: raw, r: br}, sessionKey, false /* isClient */)
 			if err != nil {
 				raw.Close()
 				return
@@ -286,9 +295,75 @@ func serveConn(ctx context.Context, raw net.Conn, cfg Config, handle Handler) {
 		}
 	}
 
+	raw.SetReadDeadline(time.Time{})
+
 	// Not a Warren client (or a censor's probe) — splice to the real site
 	// so whatever they see is indistinguishable from a normal visit.
 	spliceToFallback(ctx, raw, br, cfg.FallbackAddr)
+}
+
+// completeHandshake consumes the client's ClientHello record, sends the
+// ServerHello and a ChangeCipherSpec, and consumes the client's own
+// ChangeCipherSpec, leaving the stream positioned at the first application
+// data record.
+func completeHandshake(raw net.Conn, br *bufio.Reader, helloRecordLen int, serverHello []byte) error {
+	// Consume the *entire* ClientHello record, not just the prefix we peeked:
+	// extensions and key shares still follow it on the wire and would
+	// otherwise be misread as the first application data record.
+	if _, err := br.Discard(helloRecordLen); err != nil {
+		return err
+	}
+	if _, err := raw.Write(serverHello); err != nil {
+		return err
+	}
+	if _, err := raw.Write(changeCipherSpecRecord()); err != nil {
+		return err
+	}
+	if _, err := readRecord(br, recordTypeChangeCipherSpec); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parsedClientHello is the parsed hello plus the hybrid key share we need.
+type parsedClientHello struct {
+	*utls.PubClientHelloMsg
+	share []byte
+}
+
+// peekClientHello reads a complete TLS record containing a ClientHello from r
+// without consuming it, and parses it. Peeking the whole record (rather than
+// reading a fixed-offset prefix) is what makes a segmented arrival a non-issue:
+// bufio blocks until the record is complete or the sniff deadline fires, and on
+// the fallback path every original byte is still in the buffer to be spliced.
+func peekClientHello(r *bufio.Reader) (*parsedClientHello, int, error) {
+	head, err := r.Peek(recordHeaderLen + 1)
+	if err != nil {
+		return nil, 0, ErrShortRead
+	}
+	if head[0] != recordTypeHandshake || head[5] != 0x01 /* client_hello */ {
+		return nil, 0, ErrNotClientHello
+	}
+	bodyLen := int(head[3])<<8 | int(head[4])
+	if bodyLen < 4 || bodyLen > maxRecordLen {
+		return nil, 0, ErrNotClientHello
+	}
+	recordLen := recordHeaderLen + bodyLen
+
+	record, err := r.Peek(recordLen)
+	if err != nil {
+		return nil, 0, ErrShortRead
+	}
+
+	msg := utls.UnmarshalClientHello(record[recordHeaderLen:])
+	if msg == nil || len(msg.Random) != 32 || len(msg.SessionId) != sessionIDLen {
+		return nil, 0, ErrNotClientHello
+	}
+	share, err := hybridShare(msg.KeyShares)
+	if err != nil {
+		return nil, 0, err
+	}
+	return &parsedClientHello{PubClientHelloMsg: msg, share: share}, recordLen, nil
 }
 
 func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallbackAddr string) {
@@ -307,10 +382,12 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 }
 
 // bufferedConn lets us keep using a bufio.Reader (which may already hold
-// buffered bytes past the ClientHello) as a net.Conn for the AEAD layer.
+// buffered bytes past the handshake) as a net.Conn for the AEAD layer.
 type bufferedConn struct {
 	net.Conn
 	r *bufio.Reader
 }
 
 func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+var errUnexpectedRecordType = errors.New("transport: unexpected TLS record type")

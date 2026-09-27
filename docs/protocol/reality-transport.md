@@ -1,90 +1,118 @@
-# L0 + L1: Discovery and Protocol Camouflage
+# L0 + L1: Discovery, Camouflage, and the Session Handshake
 
 This document covers the two lowest layers of Warren's stack, described in
 [DESIGN.md](../../DESIGN.md#anti-blocklisting-defense-model):
 
 - **L0 — Discovery/bootstrap** (`internal/discovery/bootstrap`): how a client
   finds a working relay without depending on one blockable endpoint.
-- **L1 — Protocol camouflage** (`internal/network/transport`): how a single
-  connection to that relay survives passive DPI signature matching and active
-  probing.
+- **L1 — Protocol camouflage + session handshake**
+  (`internal/network/transport`): how a single connection to that relay
+  survives passive DPI, statistical classification, and active probing, and
+  how the two sides agree on keys inside that disguise.
 
-These two are implemented and tested. Everything above them in the stack
-(marketplace routing, payment channels, ZK-Passport auth, aggregate logging)
-is deliberately not wired in yet — see [DESIGN.md](../../DESIGN.md) for why
-that ordering was chosen: a censorship-evasion tool that can't survive L0/L1
-against a real adversary makes every other layer moot, so this is the first
-thing that needed to be provable, not just specified.
+These two are implemented and tested. Everything above them (relay pool,
+accounting, measurement) is deliberately not wired in yet — see
+[DESIGN.md](../../DESIGN.md) for why that ordering was chosen: a
+censorship-evasion tool that can't survive L0/L1 against a real adversary
+makes every other layer moot.
 
-## What's actually implemented
+## L1: what's on the wire
 
-### L1: `internal/network/transport` — a "REALITY-lite" transport
+A Warren client's first packet is a syntactically valid TLS 1.3 ClientHello,
+built with [uTLS](https://github.com/refraction-networking/utls) so its
+extension order, cipher list, key shares, and ALPN match a current Chrome
+fingerprint (`transport.DefaultFingerprint`, tracking `utls.HelloChrome_Auto`).
 
-A Warren client's first packet on the wire is a syntactically valid TLS 1.3
-ClientHello, built with [uTLS](https://github.com/refraction-networking/utls)
-so its extension order, cipher list, key shares, and ALPN match a current
-Chrome fingerprint (`transport.DefaultFingerprint`, tracking
-`utls.HelloChrome_Auto`). That profile is a perishable value, not a constant:
-mainstream browsers now offer the hybrid post-quantum group
-`X25519MLKEM768` by default, so a parrot of a pre-PQ browser is a
-distinguisher rather than a disguise — smaller than real hellos and missing a
-key share real hellos carry. `Config.Fingerprint` overrides it per bridge or
-per region, since the right parrot is whatever the local population runs. A 16-byte authentication tag — `HMAC-SHA256(psk, client_random)`
-— is embedded in the ClientHello's `session_id` field (padded to the usual
-32 bytes so the field length itself isn't a tell).
+That profile is a perishable value, not a constant: mainstream browsers now
+offer the hybrid post-quantum group `X25519MLKEM768` by default, so a parrot of
+a pre-PQ browser is a distinguisher rather than a disguise — smaller than real
+hellos and missing a key share real hellos carry. `Config.Fingerprint` overrides
+it per bridge or per region, since the right parrot is whatever the local
+population runs. `TestDefaultFingerprintOffersHybridPQKeyShare` fails the build
+if the default regresses to a pre-PQ profile.
 
-The server peeks the first TLS record on every inbound connection:
+Two things ride inside the hello:
 
-- **Tag valid** → genuine Warren client. Both sides independently derive a
-  session key via HKDF from `(psk, client_random)` and switch immediately to
-  an AEAD-framed (ChaCha20-Poly1305) channel on the same TCP stream.
-- **Tag invalid, absent, or the input isn't a well-formed ClientHello at
-  all** → the raw bytes are spliced byte-for-byte to a real fallback site.
-  Whoever sent them — a normal non-Warren client, or a censor's active probe
-  — gets a completely genuine response from that real site, because that's
-  what actually answered.
+1. **A 16-byte authentication tag** in the `session_id` field (padded to the
+   usual 32 bytes so the field length isn't a tell), derived as
+   `HMAC-SHA256(ss_auth, "warren-tag-v1" || client_random || client_share)`
+   where `ss_auth = X25519(client_ephemeral, relay_identity_public)`.
+2. **The client's own ephemeral hybrid key share** — an ML-KEM-768
+   encapsulation key followed by an X25519 public key (1216 bytes), byte-for-byte
+   the layout a real browser sends for that group, so the hello's size and
+   structure are unchanged. Only the bytes are Warren's, and only the client
+   holds the private halves.
 
-This was verified against a real HTTP server standing in as the "fallback
-site": a plain socket client sending a bare `GET / HTTP/1.0` (not a Warren
-client at all) received a real `200 OK` from the fallback, proving the splice
-path works end-to-end, not just in the happy path.
+The relay peeks the first record on every inbound connection:
 
-**Two real bugs were found and fixed while building this** (worth recording
-since they're the kind of thing that looks fine in a design doc and breaks on
-first real run):
+- **Tag valid, random not seen before** → a genuine Warren client. The relay
+  answers with a real-shaped TLS 1.3 **ServerHello** carrying the ML-KEM
+  ciphertext and its own ephemeral X25519 key in a `key_share` extension, plus
+  a `ChangeCipherSpec` record; the client answers with its own
+  `ChangeCipherSpec`. Both sides then derive the session key and application
+  data flows in records framed as TLS `application_data`.
+- **Tag invalid, absent, malformed, or replayed** → the raw bytes are spliced
+  byte-for-byte to a real fallback site. Whoever sent them — an ordinary
+  non-Warren client or a censor's active probe — gets a genuine response from
+  that real site, because that's what actually answered.
 
-1. uTLS caches the ClientHello's originally-built wire bytes in `hello.Raw`,
-   and `Marshal()` returns that cache verbatim if it's non-nil — it does
-   **not** re-encode from the struct fields by default. Mutating
-   `hello.SessionId` and calling `Marshal()` silently produced the
-   *original*, unpatched bytes. Fix: clear `hello.Raw = nil` before
-   marshaling so the tag actually makes it onto the wire.
-2. The server only discarded the bytes it had peeked to extract the tag,
-   not the full ClientHello record — leaving the record's extensions/cipher
-   suite bytes sitting in the stream to be misread as the first AEAD frame's
-   length prefix. Fix: parse the record-layer length field and discard the
-   *entire* record before switching to AEAD framing.
+So the record-type sequence a client emits is `handshake`,
+`change_cipher_spec`, `application_data …` — exactly what a real TLS 1.3 client
+in middlebox-compatibility mode emits, which is asserted by
+`TestClientWireShapeIsTLSRecords`.
 
-A third issue was a genuine hardening gap, not just a test artifact: without
-a read deadline, a connection that sends a plausible record/handshake header
-claiming a large `session_id` but never sends the rest would block its
-handler goroutine forever — a cheap Slowloris-style resource exhaustion (one
-dangling connection per idle goroutine, no cap). Fixed with a 5-second sniff
-deadline, cleared once the ClientHello is fully read or the read fails.
+## The session handshake
 
-### L0: `internal/discovery/bootstrap` — multi-channel discovery
+Three shared secrets go into the AEAD key:
+
+| Secret | Derivation | Property it buys |
+|--------|-----------|------------------|
+| `ss_mlkem` | ML-KEM-768 encapsulation to the client's ephemeral key | Post-quantum: a recorded session stays unreadable to an adversary who gets a quantum computer later |
+| `ss_ecdhe` | X25519 between both sides' ephemeral keys | Forward secrecy: the keys are gone when the connection ends |
+| `ss_auth` | X25519 between the client's ephemeral key and the relay's long-term identity key | Authentication: only the intended relay can recognize the tag |
+
+`session_key = HKDF-SHA256(ss_mlkem ‖ ss_ecdhe ‖ ss_auth, salt = client_random ‖
+server_random, info = "warren hybrid v1 aead key" ‖ client_share ‖
+server_share)`. Every input has a fixed length, so the concatenations are
+unambiguous. The ML-KEM-then-ECDHE ordering follows
+draft-kwiatkowski-tls-ecdhe-mlkem, the same ordering real TLS uses for the
+group.
+
+**This replaces the static pre-shared key the first proof of concept used**,
+which was its most serious weakness:
+
+| | Static PSK (before) | Identity key + ephemerals (now) |
+|---|---|---|
+| Secret held by clients | One shared PSK, same for everyone | The relay's public key only |
+| One client compromised | Every session, past and future, readable | Nothing about any other session |
+| Relay seized later | Recorded sessions decryptable | Recorded sessions stay unreadable |
+| Tag | Function of a shared secret | Function of a per-connection exchange |
+| Post-quantum | No | Yes (hybrid ML-KEM-768) |
+
+A relay generates its identity with `node -genkey`; the public half is published
+in the bridge descriptor (`addr|sni|pubkey`), the private half never leaves the
+relay.
+
+**Replay.** Because the tag is a function of the hello, a captured hello
+re-sent verbatim validates by construction. The relay therefore keeps a bounded
+replay cache of recently-seen `client_random` values (10-minute TTL) and treats
+a repeat exactly like an unauthenticated connection: spliced to the real site.
+Without this, a censor could confirm a suspected relay by replaying one
+recorded hello and noticing the response differs from the real site's.
+
+## L0: multi-channel discovery
 
 `Multi` queries every configured `Resolver` concurrently and merges whatever
 succeeds, rather than stopping at the first one that answers. Three resolver
 types are implemented:
 
 - `DNSResolver` — TXT record lookup, injectable `LookupTXT` function so it's
-  testable without a real DNS server and so production code can point
-  different instances at different upstream resolvers (the same "don't
-  depend on one operator" logic that makes multi-resolver DNS robust against
-  a single censored resolver).
-- `FileResolver` — reads a local bridge list, one `addr|sni` per line. This
-  is the landing point for out-of-band bridge distribution (encrypted
+  testable without a real DNS server and so production code can point different
+  instances at different upstream resolvers (the same "don't depend on one
+  operator" logic that makes multi-resolver DNS robust against a single censored
+  resolver).
+- `FileResolver` — reads a local bridge list, one `addr|sni|pubkey` per line.
+  This is the landing point for out-of-band bridge distribution (encrypted
   messaging, email autoresponder — the same pattern Tor bridges use); the
   distribution mechanism itself is out of scope for this package.
 - `StaticResolver` — a fixed, compiled-in list. Last resort only: it can't be
@@ -92,70 +120,66 @@ types are implemented:
 
 `Multi.Resolve` returns success as long as *any* channel works, plus a
 per-channel report — so an operator can see which discovery channels are
-currently blocked in a given region, and a client keeps working as channels
-get blocked one at a time rather than failing outright.
+currently blocked in a given region, and a client keeps working as channels get
+blocked one at a time rather than failing outright. A descriptor missing its
+relay public key is skipped as malformed rather than accepted: a bridge without
+an identity key is unusable, and accepting it would push the failure to dial
+time, where it looks like censorship instead of a bad descriptor.
 
 ## Known gaps vs. a hardened production transport
 
-- **Static PSK instead of ephemeral ECDH.** Real REALITY (xtls/xray-core's
-  `reality` package) derives its authentication key from an X25519 exchange
-  embedded in the TLS `key_share` extension — there's no long-lived shared
-  secret to leak, rotate, or have seized. This implementation uses a simpler
-  static PSK distributed via the same channel as bridge addresses. Easier to
-  reason about and test; weaker against key compromise. Migrating to
-  xray-core's audited `reality` package (rather than reimplementing X25519-
-  in-TLS handshake internals in-house) is the recommended production path —
-  reusing an audited implementation for the cryptographically deep part is
-  the right call, not a shortcut.
-- **No TLS 1.3 state-machine mimicry after the ClientHello.** Genuine
-  connections switch straight to Warren's own AEAD framing right after the
-  ClientHello; a censor recording and replaying the full byte sequence of a
-  session (not just the first packet) would notice it doesn't continue as a
-  real TLS 1.3 handshake (ServerHello, Certificate, Finished, ...). Full
-  REALITY avoids this because the non-Warren fallback path *is* a real
-  handshake all the way through. Out of scope for this proof of concept.
-- **Sniff latency on short, non-ClientHello-shaped input.** The server needs
-  44 bytes to even check the tag (fixed offset through `session_id`). A
-  request shorter than that (e.g. a bare `GET /` under the TLS record
-  minimum) waits out the full 5-second sniff timeout before falling back.
-  Real TLS ClientHellos are always well over this size, so real HTTPS
-  traffic isn't affected — but naive test clients (or an unusually terse
-  probe) will see the full delay.
-- **Segmented ClientHello not yet exercised in tests.** The current profile's
-  hello is ~1.5 KB (see `TestClientHelloSpansMultipleSegments`), which does not
-  arrive in a single TCP segment on a real network. The tag sits at a fixed
-  offset inside the first record, so extraction is unaffected in principle, and
-  the server discards the whole record by its length field — but the tests
-  exercise a loopback socket, not realistic segmentation, and the 5-second
-  sniff deadline has not been validated against a slow, fragmented arrival of a
-  legitimate hello.
-- **No cover traffic / packet-size normalization yet.** DESIGN.md's
-  "fixed-bucket sizing + constant-rate cover traffic" ML-classifier defense
-  isn't implemented at this layer — this PoC proves the tag+fallback
-  mechanism, not the full traffic-shape defense.
+- **No TLS 1.3 state-machine mimicry after the ServerHello.** The relay's
+  second flight is *shaped* like TLS (ServerHello with a real hybrid key_share,
+  ChangeCipherSpec, then records typed `application_data`), but it is not a real
+  TLS handshake: there is no Certificate/Finished, and Warren's own AEAD keys
+  protect the session instead. A censor who holds a valid tag (i.e. already
+  knows a relay's public key and has a client) could observe that the flight
+  never completes a TLS handshake. Full REALITY avoids this because its
+  non-Warren path *is* a real handshake all the way through. Migrating the
+  authentication path to xray-core's audited `reality` package — or extending
+  this one to complete a borrowed handshake — is the remaining decision;
+  note that upstream REALITY is X25519-only today, so adopting it as-is would
+  trade the post-quantum property for the mimicry property.
+- **Traffic shape is unmodified.** DESIGN.md's `bucket`/`cover` regimes
+  (§6.4) aren't implemented; record sizes track payload sizes, so a flow
+  classifier still sees Warren's own size and timing distribution.
+- **Bridge descriptors are unsigned.** The relay public key means a hostile
+  discovery channel can no longer silently steer a client onto a censor-run
+  relay *that the client will talk to* — the tag simply won't validate — but a
+  channel can still hand out addresses that waste a client's time. Signed,
+  expiring descriptors are the next L0 item.
+- **Sniff latency on short, non-ClientHello-shaped input.** A connection whose
+  record header claims more bytes than it ever sends waits out the 5-second
+  sniff deadline before falling through. Real HTTPS clients are unaffected;
+  an unusually terse probe sees the delay.
 
 ## Running the demo
 
 ```bash
-export WARREN_PSK_HEX=$(openssl rand -hex 32)   # both sides must share this
+# 1. generate the relay identity (private half stays here, public half is published)
+eval "$(go run ./cmd/node -genkey | head -1)"   # exports WARREN_RELAY_KEY_HEX
+go run ./cmd/node -genkey                        # prints a pair; note the public key
 
-# Terminal 1 — a stand-in "real site" the node borrows an identity from
+# 2. a stand-in "real site" the relay borrows an identity from
 python3 -m http.server 9443
 
-# Terminal 2 — the relay
+# 3. the relay
 go run ./cmd/node -listen=127.0.0.1:8443 \
   -fallback-addr=127.0.0.1:9443 -fallback-sni=www.example.com
 
-# Terminal 3 — the client
-go run ./cmd/cli -addr=127.0.0.1:8443 -fallback-sni=www.example.com \
-  -message="hello from behind the firewall"
+# 4. a bridge descriptor, as an out-of-band channel would distribute it
+echo "127.0.0.1:8443|www.example.com|<relay public key hex>" > bridges.txt
+
+# 5. the client
+go run ./cmd/cli -bridge-file=bridges.txt -message="hello from behind the firewall"
 ```
 
 A genuine Warren client gets its message echoed back over the AEAD channel.
-A plain HTTP client pointed at the same port and given time to clear the
-sniff window gets a real response from whatever's running on
-`-fallback-addr` — try `curl -v --http1.0 http://127.0.0.1:8443/` and compare
-against hitting port 9443 directly.
+Then act like a censor's probe: `curl -v --http1.0 http://127.0.0.1:8443/`
+returns a real response from whatever is on `-fallback-addr`. A client holding
+the wrong relay key gets the same treatment as the probe — it is spliced to the
+real site and its `Dial` fails, because a Warren relay it cannot authenticate to
+is indistinguishable from a web server.
 
 ## Tests
 
@@ -163,11 +187,35 @@ against hitting port 9443 directly.
 go test ./internal/network/transport/... ./internal/discovery/bootstrap/... -race
 ```
 
-Covers: the camouflage profile actually offering a hybrid post-quantum key
-share (a staleness guard — it fails the moment `DefaultFingerprint` regresses
-to a pre-PQ profile) and the resulting hello size, genuine-client round trip
-over AEAD framing, untagged/malformed
-input falling through to the real fallback (not reaching the Warren
-handler), bridge-file parsing (including skipping malformed lines rather
-than failing the whole file), and `Multi` surviving partial discovery-channel
-failure while deduplicating bridges returned by more than one channel.
+Covers: the full hybrid handshake round trip; untagged input spliced to the real
+site without reaching the Warren handler; a client holding the **wrong relay
+key** treated as a probe; a **replayed ClientHello** spliced to the real site;
+a **segmented ClientHello** (delivered in 137-byte chunks through a fragmenting
+proxy) still authenticating, which is the realistic arrival pattern for a
+~1.5 KB hybrid hello; the client's on-wire **record-type sequence** matching a
+real TLS 1.3 client; **per-connection ephemerality** of every secret, including
+a relay with a different identity key failing the tag check; and the camouflage
+profile still offering a hybrid PQ key share.
+
+## Bugs found while building this
+
+Worth recording since they're the kind of thing that looks fine in a design doc
+and breaks on first real run.
+
+1. uTLS caches the ClientHello's originally-built wire bytes in `hello.Raw`,
+   and `Marshal()` returns that cache verbatim if it's non-nil — it does **not**
+   re-encode from the struct fields. Mutating `SessionId`/`KeyShares` and
+   calling `Marshal()` silently produced the *original*, unpatched bytes. Fix:
+   clear `hello.Raw = nil` before marshaling.
+2. The relay originally discarded only the bytes it had peeked to extract the
+   tag, not the full ClientHello record — leaving the record's remaining bytes
+   in the stream to be misread as the first frame's length prefix. Fix: parse
+   the record-layer length and discard the entire record.
+3. Without a read deadline, a connection sending a plausible record header and
+   then nothing would block its handler goroutine forever — a cheap
+   Slowloris-style resource exhaustion. Fixed with a 5-second sniff deadline.
+4. When the relay started sending a real-shaped `ChangeCipherSpec` after its
+   ServerHello, the client didn't consume it and read it as the first
+   application-data record. The record framing is what caught it, since the
+   type byte no longer matched — a bespoke length prefix would have desynced
+   silently.

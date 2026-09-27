@@ -53,12 +53,12 @@
 ## 0. Implementation Status
 
 This document describes a design, not a shipped system. As of this revision the
-repository contains roughly 1,100 lines of Go, and exactly two things work:
+repository contains roughly 1,700 lines of Go, and exactly two things work:
 
 | Layer | Component | Status |
 |-------|-----------|--------|
 | L0 | `internal/discovery/bootstrap` — multi-channel bridge resolution (DNS TXT / file / static), partial-failure tolerant | **Implemented + tested** |
-| L1 | `internal/network/transport` — "REALITY-lite" tagged ClientHello with real-site fallback splice, AEAD framing | **Implemented + tested (PoC, known gaps)** |
+| L1 | `internal/network/transport` — tagged ClientHello with real-site fallback splice, hybrid post-quantum session handshake (X25519 + ML-KEM-768), TLS-record framing, replay cache | **Implemented + tested (known gaps)** |
 | L2 | Relay pool, routing, reputation | Not started |
 | L3 | Payment channels, contracts | Solidity sketches only, never compiled or deployed |
 | L4 | Measurement / analytics | Not started |
@@ -325,21 +325,44 @@ gaps below. This is the layer where this revision changes the most.
 ### 6.1 What exists
 
 A Warren client's first packet is a syntactically valid TLS 1.3 ClientHello built
-with [uTLS](https://github.com/refraction-networking/utls), carrying a 16-byte
-`HMAC-SHA256(psk, client_random)` tag in the `session_id` field (padded to the
-usual 32 bytes). The relay peeks the first record:
+with [uTLS](https://github.com/refraction-networking/utls). Two things ride inside
+it: a 16-byte authentication tag in the `session_id` field, and the client's own
+ephemeral **X25519MLKEM768** key share in the exact wire layout a real browser
+sends for that group (ML-KEM-768 encapsulation key ‖ X25519 public key).
 
-- **Tag valid** → both sides derive a session key via HKDF from
-  `(psk, client_random)` and switch to AEAD framing (ChaCha20-Poly1305) on the
-  same TCP stream.
-- **Tag invalid, absent, or input isn't a well-formed ClientHello** → the raw
-  bytes are spliced byte-for-byte to a real fallback site, so a probe gets a
-  genuine response from a genuine service, because that is literally what
-  answered.
+The tag is `HMAC-SHA256(ss_auth, "warren-tag-v1" ‖ client_random ‖ client_share)`
+where `ss_auth = X25519(client_ephemeral, relay_identity_public)`. The relay peeks
+the first record:
 
-This mechanism is the right one, and it is verified end-to-end. Its weaknesses are
-documented in `docs/protocol/reality-transport.md`; three of them are now design
-blockers rather than acceptable PoC debt.
+- **Tag valid, random unseen** → the relay answers with a real-shaped TLS 1.3
+  ServerHello carrying the ML-KEM ciphertext plus its own ephemeral X25519 key,
+  then a ChangeCipherSpec; the client answers with its own ChangeCipherSpec.
+  Both sides derive the session key from three secrets — ML-KEM (post-quantum),
+  ephemeral X25519 (forward secrecy), and the identity exchange (authentication)
+  — and application data flows in records framed as TLS `application_data`.
+- **Tag invalid, absent, malformed, or replayed** → the raw bytes are spliced
+  byte-for-byte to a real fallback site, so a probe gets a genuine response from
+  a genuine service, because that is literally what answered.
+
+Three properties this buys over the first proof of concept, which authenticated
+with a static pre-shared key and derived its session key from that PSK alone:
+
+1. **No shared secret exists.** Clients hold only the relay's public key, so a
+   compromised client reveals nothing about any other session.
+2. **Forward secrecy.** Seizing a relay's identity key does not decrypt sessions
+   recorded earlier; the ephemeral halves are gone.
+3. **Post-quantum confidentiality** for recorded traffic, which matters because
+   circumvention traffic is exactly what gets recorded for later analysis.
+
+Replay is handled explicitly: the tag is a function of the hello, so a captured
+hello re-sent verbatim would validate. The relay keeps a bounded replay cache of
+recent `client_random` values and treats a repeat like any unauthenticated
+connection — spliced to the real site — so a censor cannot confirm a relay by
+replaying one recording.
+
+Remaining gaps are documented in `docs/protocol/reality-transport.md`; the
+blocking one is now the state machine after the ServerHello, not the key
+schedule.
 
 ### 6.2 Camouflage profiles are perishable (new, blocking)
 
@@ -349,17 +372,17 @@ share**. In an environment where a large share of genuine browser handshakes off
 both stale relative to the claimed browser version and small relative to the real
 size distribution.
 
-Required:
+Status: **done**, except per-region selection.
 
-- Track a **current** profile (uTLS `HelloChrome_Auto` / an explicit recent
-  profile such as `HelloChrome_133`), and treat the pinned version as a value that
-  expires. uTLS 1.8.x profiles for Chrome 131/133 include `X25519MLKEM768`.
-- **Handle the multi-segment ClientHello.** A ~1.7 KB hybrid ClientHello does not
-  arrive in one TCP segment. The tag lives at a fixed offset inside the first
-  record, so tag extraction still works, but the relay's record-boundary handling
-  and its 5-second sniff deadline must be re-validated against realistic segmented
-  arrival, not against the small 2023-shaped hello the tests currently exercise.
-- **Profile-refresh test.** CI asserts the active profile's key-share groups
+- ✅ Track a **current** profile: `DefaultFingerprint` is `utls.HelloChrome_Auto`,
+  and `Config.Fingerprint` overrides it per bridge. The resulting hello is
+  ~1.5 KB and carries `X25519MLKEM768`, which Warren's own handshake now hides
+  inside rather than merely parroting.
+- ✅ **Multi-segment ClientHello.** The relay peeks the whole record rather than a
+  fixed-offset prefix, so a segmented arrival blocks until the record is complete
+  or the sniff deadline fires. Exercised by a test that delivers the hello in
+  137-byte chunks through a fragmenting proxy.
+- ✅ **Profile-refresh test.** CI asserts the active profile's key-share groups
   include a hybrid PQ group, so the disguise can't silently rot.
 - **Per-region profile choice.** The right parrot is "what the local population
   actually runs", which is not globally uniform. The profile is a configuration
@@ -680,8 +703,8 @@ recording today could be decrypted later.
 
 | Purpose | Choice | Rationale |
 |---------|--------|-----------|
-| Session key exchange (Warren data plane) | **Hybrid X25519 + ML-KEM-768** | FIPS 203 standardized 2024; harvest-now-decrypt-later applies to long-lived recordings of circumvention traffic |
-| Camouflage handshake shape | uTLS profile whose `key_share` includes `X25519MLKEM768` | Must match what real browsers send *now* (§6.2) |
+| Session key exchange (Warren data plane) | **Hybrid X25519 + ML-KEM-768** — *implemented* (`crypto/mlkem`, `crypto/ecdh`) | FIPS 203 standardized 2024; harvest-now-decrypt-later applies to long-lived recordings of circumvention traffic |
+| Camouflage handshake shape | uTLS profile whose `key_share` includes `X25519MLKEM768` — *implemented* | Must match what real browsers send *now* (§6.2), and it is where Warren's own key exchange hides |
 | AEAD | ChaCha20-Poly1305 default; AES-256-GCM where hardware AES is present | ChaCha for CPU-only/mobile; AES-NI/ARMv8-crypto devices are faster with GCM |
 | Hash / KDF | SHA-256 (interop), BLAKE3 (bulk), HKDF-SHA256 | Unchanged, still correct |
 | Signatures (descriptors, releases) | Ed25519 now; **ML-DSA-65 hybrid planned** | FIPS 204; signature agility must exist before it is needed |
@@ -690,9 +713,10 @@ recording today could be decrypted later.
 | ZK (only if attribute proofs are needed) | **gnark** (Go) or Noir/Halo2-class | libsnark is unmaintained and is removed from the stack |
 | RNG | OS CSPRNG (`getrandom`, `BCryptGenRandom`) | Unchanged |
 
-Retired from the earlier design: static PSK as the long-term authentication root
-(migration target is an audited REALITY implementation with ECDH-in-`key_share`),
-libsnark, and the Kyber draft groups superseded by ML-KEM.
+Retired from the earlier design: **the static PSK is gone** — authentication is now
+an X25519 exchange with the relay's long-term identity key, whose public half
+travels in the bridge descriptor; libsnark; and the Kyber draft groups superseded
+by ML-KEM.
 
 ---
 
@@ -721,14 +745,16 @@ kilobit link.
 
 | Threat | Adversary | Mitigation | Status |
 |--------|-----------|-----------|--------|
-| Payload signature DPI | ISP, state | Camouflaged transport, real-site fallback (§6.1) | Implemented (PoC) |
-| Active probing | State probe infrastructure | Untagged connections receive a genuine response from the real fallback site | Implemented (PoC) |
-| Stale-parrot fingerprinting | State classifier | Current uTLS profile incl. hybrid PQ key share, CI staleness check (§6.2) | **Gap — action required** |
-| TLS state-machine mimicry after ClientHello | Censor replaying a full session | Migration to an audited REALITY implementation keeping the real handshake throughout | Gap (documented) |
+| Payload signature DPI | ISP, state | Camouflaged transport, real-site fallback, TLS-record framing (§6.1) | Implemented |
+| Active probing | State probe infrastructure | Untagged, wrong-key, and replayed connections all receive a genuine response from the real fallback site | Implemented |
+| Stale-parrot fingerprinting | State classifier | Current uTLS profile incl. hybrid PQ key share, CI staleness check (§6.2) | Implemented (per-region selection: gap) |
+| TLS state-machine mimicry after ServerHello | Censor who holds a valid tag and watches a full session | Real-shaped ServerHello + ChangeCipherSpec + `application_data` records; a complete borrowed handshake still missing | Partial (documented) |
 | Statistical flow classification | State classifier | Shaping regimes with stated cost (§6.4) | Not started |
 | IP/ASN blocklisting | Bulk range blocking | Residential pool scale + churn (§7.1) | Not started |
 | Relay pool enumeration | Censor harvesting the pool | No global list; rotating per-requester subsets; token-rate-limited discovery (§7.2) | Design changed, not started |
 | Discovery takedown | Blocking the bridge source | Multi-channel resolvers, signed lists, no central API (§5) | Implemented (signing: gap) |
+| Hostile discovery channel steering clients to a censor-run relay | Censor operating a bridge channel | Per-relay identity key in the descriptor: a client cannot authenticate to a relay whose key it wasn't given | Implemented |
+| Captured-hello replay | Probe re-sending a recorded hello | Bounded replay cache on `client_random`; a repeat is spliced to the real site (§6.1) | Implemented |
 | Client distribution takedown | App-store removal orders | Reproducible builds, ≥3 non-app-store channels (§5.1) | Not started |
 | Throttling instead of blocking | State traffic management | Goodput-based health, degraded-vs-blocked signal (§7.3, §9) | Not started |
 | Sybil relays / malicious sellers | Profit-motivated or state-run nodes | Local-first reputation, collateral where settlement is on, path diversity | Not started |
@@ -737,7 +763,7 @@ kilobit link.
 | Evasion-log exposure | Future adversary reading an immutable ledger | On-chain per-event logging removed; threshold aggregation only (§9) | Design changed |
 | Exit-node abuse → operator liability | Criminal users; police; ISP | Relay≠exit default, declared exit policy, abuse handling, no identifying logs (§7.4) | **New requirement, not started** |
 | Mesh flooding | Attacker on LoRa | Control-plane-only classes, prioritized store-and-forward, no per-byte payouts (§10.2) | Design changed |
-| Harvest-now-decrypt-later | Well-resourced recorder | Hybrid X25519+ML-KEM-768 session handshake (§11) | Not started |
+| Harvest-now-decrypt-later | Well-resourced recorder | Hybrid X25519+ML-KEM-768 session handshake (§11) | Implemented |
 | Slowloris on the sniff path | Cheap resource exhaustion | 5-second sniff deadline | Implemented |
 | Allowlist regime / shutdown | State, physical + policy layer | Degradation ladder rungs 5–7, stated honestly as partial (§6.5, §10) | Not started |
 
@@ -823,11 +849,16 @@ predecessor's gate is met.
 
 - [x] Tagged ClientHello + real-site fallback splice, tested end-to-end
 - [x] Multi-channel bridge resolution with partial-failure reporting
-- [ ] Current camouflage profile with hybrid PQ key share; segmented-hello handling
-- [ ] CI staleness assertion on the active profile's key-share groups
-- [ ] Hybrid X25519+ML-KEM-768 for the Warren session handshake
-- [ ] Signed bridge descriptors (kill the unauthenticated-DNS steering risk)
-- [ ] Migration to an audited REALITY implementation, or a documented decision not to
+- [x] Current camouflage profile with hybrid PQ key share; segmented-hello handling
+- [x] CI staleness assertion on the active profile's key-share groups
+- [x] Hybrid X25519+ML-KEM-768 session handshake; static PSK removed; per-relay
+      identity keys carried in the bridge descriptor
+- [x] Replay cache, so a captured hello can't be used to confirm a relay
+- [x] TLS-record framing for application data (no bespoke length prefix)
+- [ ] Signed, expiring bridge descriptors
+- [ ] Complete borrowed TLS handshake, or migration to an audited REALITY
+      implementation — note upstream REALITY is X25519-only, so adopting it
+      as-is trades the post-quantum property for the mimicry property
 
 **Gate:** an isolated active-probe harness — a probe that connects, replays, and
 resumes against a Warren relay — cannot distinguish it from the borrowed site, and

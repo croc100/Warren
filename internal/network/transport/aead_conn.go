@@ -9,14 +9,18 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-const maxFrameLen = 1 << 16 // 64KiB, keeps frames well under typical MTU-driven fragmentation
+// maxPlaintextLen keeps a sealed record (plaintext + 16-byte tag) inside TLS's
+// 2^14 record body limit, so Warren's records sit in the same size distribution
+// as a real TLS peer's rather than at lengths no TLS stack would produce.
+const maxPlaintextLen = 1<<14 - 16
 
-var errFrameTooLarge = errors.New("transport: frame exceeds maxFrameLen")
+var errFrameTooLarge = errors.New("transport: record exceeds the TLS record length limit")
 
-// aeadConn wraps a net.Conn with ChaCha20-Poly1305 framing keyed by a session
-// key both peers derived independently via deriveSessionKey. Client and
-// server use disjoint nonce spaces (odd/even counters) so the same key can
-// safely encrypt both directions without a nonce collision.
+// aeadConn wraps a net.Conn with ChaCha20-Poly1305 protection keyed by the
+// session key both peers derived from the hybrid handshake, framed as TLS
+// application_data records. Client and server use disjoint nonce spaces
+// (odd/even counters) so the same key can safely encrypt both directions
+// without a nonce collision.
 type aeadConn struct {
 	net.Conn
 	aead interface {
@@ -48,22 +52,25 @@ func (c *aeadConn) nonce(counter uint64, odd bool) []byte {
 	return n
 }
 
+func recordHeader(bodyLen int) []byte {
+	return []byte{recordTypeApplicationData, 0x03, 0x03, byte(bodyLen >> 8), byte(bodyLen)}
+}
+
 func (c *aeadConn) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		chunk := p
-		if len(chunk) > maxFrameLen {
-			chunk = chunk[:maxFrameLen]
+		if len(chunk) > maxPlaintextLen {
+			chunk = chunk[:maxPlaintextLen]
 		}
-		sealed := c.aead.Seal(nil, c.nonce(c.sendCounter, c.sendOdd), chunk, nil)
+		header := recordHeader(len(chunk) + c.aead.Overhead())
+		// The header is authenticated as additional data, exactly as TLS
+		// 1.3 does: a middlebox that rewrites a record length can't make
+		// the peer accept the result.
+		sealed := c.aead.Seal(nil, c.nonce(c.sendCounter, c.sendOdd), chunk, header)
 		c.sendCounter++
 
-		var lenPrefix [4]byte
-		binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(sealed)))
-		if _, err := c.Conn.Write(lenPrefix[:]); err != nil {
-			return total, err
-		}
-		if _, err := c.Conn.Write(sealed); err != nil {
+		if _, err := c.Conn.Write(append(header, sealed...)); err != nil {
 			return total, err
 		}
 		total += len(chunk)
@@ -74,19 +81,22 @@ func (c *aeadConn) Write(p []byte) (int, error) {
 
 func (c *aeadConn) Read(p []byte) (int, error) {
 	if len(c.readBuf) == 0 {
-		var lenPrefix [4]byte
-		if _, err := io.ReadFull(c.Conn, lenPrefix[:]); err != nil {
+		var head [recordHeaderLen]byte
+		if _, err := io.ReadFull(c.Conn, head[:]); err != nil {
 			return 0, err
 		}
-		n := binary.BigEndian.Uint32(lenPrefix[:])
-		if n > maxFrameLen+uint32(c.aead.Overhead()) {
+		if head[0] != recordTypeApplicationData {
+			return 0, errUnexpectedRecordType
+		}
+		bodyLen := int(head[3])<<8 | int(head[4])
+		if bodyLen <= c.aead.Overhead() || bodyLen > maxRecordLen {
 			return 0, errFrameTooLarge
 		}
-		sealed := make([]byte, n)
+		sealed := make([]byte, bodyLen)
 		if _, err := io.ReadFull(c.Conn, sealed); err != nil {
 			return 0, err
 		}
-		plain, err := c.aead.Open(nil, c.nonce(c.recvCounter, !c.sendOdd), sealed, nil)
+		plain, err := c.aead.Open(nil, c.nonce(c.recvCounter, !c.sendOdd), sealed, head[:])
 		if err != nil {
 			return 0, err
 		}

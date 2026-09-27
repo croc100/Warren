@@ -8,7 +8,7 @@ This file tracks *what ships in what order*. Architecture and rationale live in
 Status legend: ✅ done · 🚧 in progress · ⬜ planned
 
 > **Read this first.** Warren is pre-alpha. Two layers exist (bootstrap discovery
-> and a camouflaged transport proof of concept, ~1,100 lines of Go); everything
+> and a camouflaged, post-quantum transport, ~1,700 lines of Go); everything
 > else is specification. See [`DESIGN.md` §0](../DESIGN.md#0-implementation-status).
 
 ---
@@ -30,7 +30,7 @@ when a month ends.
 
 | # | Slice | Gate | Status |
 |---|-------|------|--------|
-| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | 🚧 |
+| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | 🚧 (handshake done; signed descriptors + borrowed handshake left) |
 | 2 | L1 breadth + L0 distribution | Fresh client still connects with UDP/443 blocked, primary transport blocked, and bridge list expired | ⬜ |
 | 3 | L2 relay pool | 20+ node testbed usable for interactive browsing while a 24h discovery-harvesting adversary recovers < stated fraction of the pool | ⬜ |
 | 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |
@@ -50,11 +50,23 @@ no amount of marketplace or analytics matters.
   (`internal/discovery/bootstrap`)
 - ✅ Camouflage profile tracks a current browser (hybrid post-quantum key share),
   with a CI staleness guard on the profile's key-share groups
-- ⬜ Segmented-ClientHello handling validated (a PQ hello is ~1.5 KB and does not
-  arrive in one segment; the old tests only exercised a small 2023-shaped hello)
-- ⬜ Hybrid X25519 + ML-KEM-768 for the Warren session handshake itself
-- ⬜ Signed bridge descriptors (removes unauthenticated-DNS steering)
-- ⬜ Migrate to an audited REALITY implementation, or record the decision not to
+- ✅ Segmented-ClientHello handling validated — the relay peeks the whole record,
+  and a test delivers a ~1.5 KB hello in 137-byte chunks through a fragmenting proxy
+- ✅ Hybrid X25519 + ML-KEM-768 session handshake: ML-KEM for post-quantum
+  confidentiality, ephemeral X25519 for forward secrecy, and an exchange with the
+  relay's long-term identity key for authentication
+- ✅ Static pre-shared key removed. Clients hold only a relay's public key, which
+  travels in the bridge descriptor (`addr|sni|pubkey`), so a compromised client
+  reveals nothing about other sessions and a hostile discovery channel cannot
+  steer a client onto a relay it can authenticate to
+- ✅ Replay cache: a captured hello re-sent verbatim is spliced to the real site,
+  so it can't be used to confirm a relay
+- ✅ Application data framed as TLS `application_data` records (the bespoke 4-byte
+  length prefix is gone), with the record header authenticated as AEAD associated data
+- ⬜ Signed, expiring bridge descriptors
+- ⬜ Complete the borrowed TLS handshake, or migrate to an audited REALITY
+  implementation — upstream REALITY is X25519-only, so adopting it as-is would
+  trade the post-quantum property for the mimicry property
 
 **Gate:** an isolated active-probe harness — connect, replay, resume — cannot
 distinguish a Warren relay from the borrowed site, and the client's hello is not

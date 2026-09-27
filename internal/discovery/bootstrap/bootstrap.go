@@ -11,6 +11,7 @@ package bootstrap
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -22,19 +23,37 @@ import (
 type Bridge struct {
 	Addr        string // host:port
 	FallbackSNI string // the real site this bridge borrows a TLS identity from
+
+	// PublicKeyHex is the relay's long-term X25519 identity key, hex-encoded
+	// (64 characters). A client needs it to authenticate itself to that relay
+	// and to derive a session key, and it is per-relay rather than shared, so
+	// learning one bridge's key gives an adversary nothing about any other.
+	PublicKeyHex string
 }
 
-func (b Bridge) String() string { return fmt.Sprintf("%s|%s", b.Addr, b.FallbackSNI) }
+func (b Bridge) String() string {
+	return fmt.Sprintf("%s|%s|%s", b.Addr, b.FallbackSNI, b.PublicKeyHex)
+}
 
-// ParseBridge parses the "addr|sni" wire format used by both the DNS TXT and
-// file-based resolvers below.
+// ParseBridge parses the "addr|sni|pubkey" wire format used by both the DNS TXT
+// and file-based resolvers below. All three fields are required: a bridge
+// without its identity key is unusable, and silently accepting one would push
+// the failure to dial time, where it looks like censorship rather than a
+// malformed descriptor.
 func ParseBridge(s string) (Bridge, error) {
-	parts := strings.SplitN(strings.TrimSpace(s), "|", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return Bridge{}, fmt.Errorf("bootstrap: malformed bridge line %q, want \"addr|sni\"", s)
+	parts := strings.Split(strings.TrimSpace(s), "|")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return Bridge{}, fmt.Errorf("bootstrap: malformed bridge line %q, want \"addr|sni|pubkey\"", s)
 	}
-	return Bridge{Addr: parts[0], FallbackSNI: parts[1]}, nil
+	key, err := hex.DecodeString(parts[2])
+	if err != nil || len(key) != publicKeyLen {
+		return Bridge{}, fmt.Errorf("bootstrap: bridge %q: public key must be %d hex chars", parts[0], publicKeyLen*2)
+	}
+	return Bridge{Addr: parts[0], FallbackSNI: parts[1], PublicKeyHex: parts[2]}, nil
 }
+
+// publicKeyLen is the length of an X25519 identity key in bytes.
+const publicKeyLen = 32
 
 // Resolver is one independent discovery channel.
 type Resolver interface {
@@ -60,7 +79,7 @@ func (s StaticResolver) Resolve(ctx context.Context) ([]Bridge, error) {
 	return s.Bridges, nil
 }
 
-// FileResolver reads a bridge list from a local file, one "addr|sni" per
+// FileResolver reads a bridge list from a local file, one "addr|sni|pubkey" per
 // line. This is how out-of-band-distributed bridges (shared via encrypted
 // messaging, email autoresponder, etc. — the same pattern Tor bridges use)
 // reach a client: the distribution mechanism is outside this package's
