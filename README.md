@@ -244,7 +244,10 @@ internal/network/tlsrec      shared TLS record-layer vocabulary
 internal/discovery/bootstrap discovery channels and signed descriptors
 ```
 
-Everything else in the tree is a placeholder for work described in `DESIGN.md`.
+That is the whole tree. The aspirational directory skeleton this repository used to
+carry — placeholders for a marketplace, satellite adapters, contracts, dashboards —
+was deleted: `DESIGN.md` says what will live where, and a tree that implies
+capability is its own kind of dishonesty.
 
 ## Contributing
 

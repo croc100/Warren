@@ -7,9 +7,12 @@ This file tracks *what ships in what order*. Architecture and rationale live in
 
 Status legend: ✅ done · 🚧 in progress · ⬜ planned
 
-> **Read this first.** Warren is pre-alpha. Two layers exist (bootstrap discovery
-> and a camouflaged, post-quantum transport, ~1,700 lines of Go); everything
-> else is specification. See [`DESIGN.md` §0](../DESIGN.md#0-implementation-status).
+> **Read this first.** Warren is pre-alpha. Three things exist — bridge discovery
+> with signed descriptors, a camouflaged post-quantum transport that imitates its
+> borrowed site's handshake shape, and the harness that gates both (~5,500 lines of
+> Go, about half of it tests). Everything else is specification. Slice 1's gate
+> passing is **not** deployability: see the note under Slice 1.
+> Full status: [`DESIGN.md` §0](../DESIGN.md#0-implementation-status).
 
 ---
 
@@ -149,7 +152,7 @@ per-session data appearing nowhere on chain.
 ## Slice 5 — L4 private measurement ⬜
 
 Replaces the on-chain Independence Logger, which is retired
-([why](../DESIGN.md#91-why-the-old-design-is-retired)).
+([why](../DESIGN.md#91-why-on-chain-event-logging-is-out)).
 
 - ⬜ Threshold-aggregated telemetry (Prio/STAR-class) over Oblivious HTTP
 - ⬜ Opt-in, per-region, with a k-anonymity floor below which nothing is emitted

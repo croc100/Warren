@@ -1,32 +1,9 @@
 # Warren Technical Architecture & Design
 
-> **Revision note (2026-09):** This revision re-bases the design on the 2026
-> censorship, cryptography, and regulatory environment, and on the honest state of
-> the repository (see [§0](#0-implementation-status)). The substantive changes:
->
-> 1. **Post-quantum TLS is now the baseline**, which changes L1 camouflage from
->    "look like a browser" to "look like a *current* browser, including its hybrid
->    ML-KEM key share" — a 2023-era ClientHello is now itself a fingerprint.
-> 2. **Application whitelisting and full shutdowns are no longer forward-looking
->    risks**; they are deployed. The design adds an explicit degradation ladder
->    instead of assuming "generic HTTPS" always suffices.
-> 3. **Transport is re-specified as pluggable**, with QUIC/MASQUE (RFC 9298/9484)
->    as a first-class path rather than a custom framing over TCP only.
-> 4. **The on-chain per-event Independence Logger is retired** and replaced with
->    private aggregate telemetry (Prio/STAR-class), which preserves the analytics
->    revenue line while removing an unnecessary privacy liability and a dead
->    dependency (libsnark).
-> 5. **Settlement moves off L1 mainnet and out of the critical path.** The core
->    protocol works with no token at all; value transfer is an optional adapter.
-> 6. **Abuse containment and operator liability are now first-class**, because
->    "residential nodes relay strangers' traffic" is the same shape as the
->    residential-proxy abuse problem that drew law-enforcement action in 2024–2025.
-> 7. **Satellite/mesh is re-specified as a link type**, not an API integration.
->    The old failover pseudocode assumed a Starlink tunnel API that does not exist
->    and a LoRa control-plane capacity ~1–2 orders of magnitude too optimistic.
->
-> Superseded decisions and the reason each was dropped are listed in
-> [§14](#14-deprecated-decisions).
+> This document is the standing design, not a diff. Decisions that were dropped on
+> the way here — and why — are in [§14](#14-deprecated-decisions); what changed when
+> is in [`docs/CHANGELOG.md`](docs/CHANGELOG.md); the one architectural decision with
+> its own write-up is [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md).
 
 ## Table of Contents
 
@@ -62,14 +39,14 @@ things work:
 | L1 | `internal/network/transport` — tagged ClientHello with real-site fallback splice, hybrid post-quantum session handshake (X25519 + ML-KEM-768), TLS-record framing, replay cache, measured borrowed-site flight imitation | **Implemented + tested (known gaps)** |
 | L1 | `internal/network/probe`, `cmd/probe` — active-probe suite and record-shape comparison against the borrowed site; the gate | **Implemented + tested** |
 | L2 | Relay pool, routing, reputation | Not started |
-| L3 | Payment channels, contracts | Solidity sketches only, never compiled or deployed |
+| L3 | Payment channels, settlement | Not started. The earlier Solidity sketches were deleted rather than kept: they described a design §8 has since replaced |
 | L4 | Measurement / analytics | Not started |
 | — | Satellite, LoRa, Crovi/Thump integration | Not started |
 
 Everything else in this document is specification. Where a section describes
-something unbuilt, it says so. Treating the rest of this file as a description of
-existing capability would be a misrepresentation — the directory tree is mostly
-`.gitkeep` files.
+something unbuilt, it says so. The repository tree now contains only what exists:
+the aspirational directory skeleton that used to stand in for these layers has been
+deleted, because a tree that implies capability is its own kind of dishonesty.
 
 Two consequences for how to read the roadmap in [§16](#16-roadmap):
 
@@ -292,7 +269,7 @@ operators can see *which* channel is blocked in which region. Resolvers today:
 DNS TXT (injectable lookup), local bridge file (the landing point for
 out-of-band distribution), and a compiled-in static list of last resort.
 
-### 5.1 Additions required by the 2026 environment
+### 5.1 Requirements
 
 - **Encrypted-transport resolvers.** Plain DNS TXT is trivially tampered with at
   the resolver. Add DoH/DoQ resolvers. (Every DNS answer is already treated as
@@ -411,7 +388,7 @@ is an L2 problem (§7.2) — and the remaining durable risk is a TLS-interceptin
 middlebox, which [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md) Stage B
 addresses if a target region deploys one.
 
-### 6.2 Camouflage profiles are perishable (new, blocking)
+### 6.2 Camouflage profiles are perishable
 
 The PoC pins `utls.HelloChrome_120` — a late-2023 profile with **no hybrid PQ key
 share**. In an environment where a large share of genuine browser handshakes offer
@@ -435,7 +412,7 @@ Status: **done**, except per-region selection.
   actually runs", which is not globally uniform. The profile is a configuration
   input resolved alongside bridges (§5), not a compile-time constant.
 
-### 6.3 Pluggable transports (new)
+### 6.3 Pluggable transports
 
 A single transport is a single point of failure. L1 is re-specified as an
 interface with several concrete implementations, selected per-bridge and
@@ -452,7 +429,7 @@ Selection is a policy, and policies are local. The client never receives "use
 transport X" as an instruction from the network without verifying it against a
 signed bridge descriptor.
 
-### 6.4 Traffic shaping, with a cost model (revised)
+### 6.4 Traffic shaping, with a cost model
 
 The prior design specified "fixed-bucket packet sizing plus constant-rate cover
 traffic during idle periods". The mechanism is right; the specification was
@@ -480,7 +457,7 @@ does not defeat a determined classifier, and published padding-defense results
 The doc must not claim otherwise, and the default must not be a regime whose bill
 the user did not agree to.
 
-### 6.5 Degradation ladder (new)
+### 6.5 Degradation ladder
 
 The client walks down this ladder and reports which rung it is on. Each rung is a
 weaker but more survivable posture:
@@ -507,7 +484,7 @@ about what they cannot do. The ladder's existence is the design's answer to
 
 **Status: not started.** This layer carries the design's central bet.
 
-### 7.1 The two-layer anti-blocklisting model (retained)
+### 7.1 The two-layer anti-blocklisting model
 
 State-scale censors block by IP/ASN reputation and by active probing, not
 primarily by decoding protocols. Commercial VPNs are blocked within days because
@@ -558,7 +535,7 @@ Reputation is local-first: each client maintains its own scores, optionally
 seeded by signed aggregate hints. A globally shared reputation score is both an
 enumeration oracle and a sybil target.
 
-### 7.4 Abuse containment and operator liability (new, blocking)
+### 7.4 Abuse containment and operator liability
 
 Nobody should run an exit without this, and the original design shipped no answer
 at all. Requirements:
@@ -585,8 +562,8 @@ at all. Requirements:
 
 ## 8. L3 — Accounting & Settlement
 
-**Status: Solidity sketches only.** Re-specified here; the old sketches
-(`contracts/`) are superseded.
+**Status: not started.** The earlier Solidity sketches have been deleted; what
+follows replaces them.
 
 ### 8.1 The core must work with settlement off
 
@@ -619,7 +596,7 @@ pluggable backends:
   open exposure, tuned against real receipt sizes). This part of the original
   design was sound and is retained.
 
-### 8.3 Access rights without identity (revised)
+### 8.3 Access rights without identity
 
 The original design authenticated relay access with a bespoke ZK "passport"
 circuit. The 2026 answer is an off-the-shelf standard: **Privacy Pass** (RFCs
@@ -635,7 +612,7 @@ ICAO-9303-based stacks now exist); in that case the library is **gnark** (Go
 native) or Noir/Halo2-class tooling, **not libsnark**, which has been unmaintained
 for years.
 
-### 8.4 Regulatory reality (new)
+### 8.4 Regulatory reality
 
 - **EU:** MiCA has been fully applicable since 30 December 2024, and DAC8
   reporting obligations begin in 2026. A freely transferable Warren token with a
@@ -652,7 +629,7 @@ for years.
 **Status: not started.** This section replaces the Independence Logger's on-chain
 per-event design.
 
-### 9.1 Why the old design is retired
+### 9.1 Why on-chain event logging is out
 
 The original scheme wrote a ZK proof of "censorship evaded in region R at time T"
 to a public chain, via bonded relayers, to support NGO/research data
@@ -692,7 +669,7 @@ immutable public log of evasion events.
 
 **Status: not started.** Re-specified as a **link type**, not an API integration.
 
-### 10.1 Corrections to the old design
+### 10.1 What the earlier design got wrong
 
 - **There is no consumer Starlink "establish tunnel" API.** The old pseudocode
   (`StarlinkClient.EstablishTunnel(gateway)`) describes something that does not
@@ -898,93 +875,26 @@ Honest list of things this design does not yet answer.
 
 ## 16. Roadmap
 
-Gated slices, ordered by "what makes everything above it moot if it fails".
-Each slice ships with its own falsifiable gate; no slice starts before its
-predecessor's gate is met.
+Slices are ordered by what makes everything above them moot if it fails, and each
+ships with a falsifiable gate rather than a date. **Per-item status lives in
+[`docs/ROADMAP.md`](docs/ROADMAP.md)** — it is the single place that tracks it, so
+the two documents cannot drift.
 
-### Slice 1 — L1 hardening (in progress)
+| # | Slice | Gate | Status |
+|---|-------|------|--------|
+| 1 | L1 transport hardening | `cmd/probe` finds nothing that separates a relay from the site it borrows | ✅ passing |
+| 2 | L1 breadth + L0 distribution | A fresh client still connects with UDP/443 blocked, the primary transport blocked, and its bridge list expired | ⬜ |
+| 3 | L2 relay pool | A 20+ node testbed stays usable while a 24-hour discovery-harvesting adversary recovers less than a stated fraction of the pool | ⬜ |
+| 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |
+| 5 | L4 measurement | A regional report that emits no sub-threshold bucket and no recoverable individual report | ⬜ |
+| 6 | Resilience + ecosystem | Link severed → data plane stops, control plane flows over mesh inside its duty-cycle budget, Thump holds a migration | ⬜ |
 
-- [x] Tagged ClientHello + real-site fallback splice, tested end-to-end
-- [x] Multi-channel bridge resolution with partial-failure reporting
-- [x] Current camouflage profile with hybrid PQ key share; segmented-hello handling
-- [x] CI staleness assertion on the active profile's key-share groups
-- [x] Hybrid X25519+ML-KEM-768 session handshake; static PSK removed; per-relay
-      identity keys carried in the bridge descriptor
-- [x] Replay cache, so a captured hello can't be used to confirm a relay
-- [x] TLS-record framing for application data (no bespoke length prefix)
-- [x] Signed, expiring bridge descriptors, with staleness as a reported state
-- [x] Active-probe and record-shape harness (Stage 0 of [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md)),
-      which immediately found two defects: a hello ~250 B short of its own
-      profile, and FIN-instead-of-RST teardown. Both fixed
-- [x] Shape-accurate server flight, measured from the borrowed site rather than
-      hardcoded, carrying key confirmation; verified byte-exact against a real
-      session by `cmd/probe` (Stage A)
-- [ ] Relayed real handshake, nested inside the hybrid session — conditional on
-      what the harness measures (Stage B)
+Warren DNS, Email and Storage are not scoped until Slice 3's gate is met: a name
+service over an unproven transport is a demo, not a product.
 
-**Gate:** an isolated active-probe harness — a probe that connects, replays, and
-resumes against a Warren relay — cannot distinguish it from the borrowed site, and
-the client's ClientHello is not distinguishable by key-share/size/version features
-from the current profile of the browser it parrots.
-
-### Slice 2 — L1 breadth + L0 distribution
-
-- [ ] `masque` transport (RFC 9298/9484) and `websocket-tunnel`
-- [ ] Transport selection policy + degradation ladder rungs 1–4
-- [ ] Reproducible builds and ≥3 non-app-store distribution channels
-- [ ] Shaping regimes `bucket` / `cover` with measured overhead
-
-**Gate:** with UDP/443 blocked, with the primary transport blocked, and with the
-newest bridge list expired, a fresh client still reaches the network, and reports
-the rung it is on.
-
-### Slice 3 — L2 relay pool
-
-- [ ] Relay/exit role separation with exit policy enforcement
-- [ ] Abuse-handling documentation and per-exit contact metadata
-- [ ] Goodput-based health and local-first reputation
-- [ ] `mode=resilience` diversity-weighted selection; rotating discovery subsets
-- [ ] Privacy Pass token issuance/redemption for discovery and session admission
-
-**Gate:** a 20+ node testbed sustains usable interactive browsing while an
-adversary process that harvests discovery responses for 24 hours recovers less
-than a stated fraction of the pool.
-
-### Slice 4 — L3 accounting
-
-- [ ] `none` and `credits` backends (core works with settlement off)
-- [ ] Off-chain signed receipts, hybrid volume/time settlement trigger
-- [ ] Optional L2 `onchain` adapter (Sepolia/Hoodi first), net balances only
-- [ ] No public listing surface anywhere in the design
-
-**Gate:** relays are paid for a week of real traffic with zero on-chain
-transactions, and separately, net settlement reconciles on an L2 testnet with
-per-session data appearing nowhere on chain.
-
-### Slice 5 — L4 measurement
-
-- [ ] Threshold-aggregated telemetry over OHTTP, opt-in, k-anonymity floor
-- [ ] Blocked-vs-degraded classification
-- [ ] OONI-compatible publication path for Lumra and external researchers
-
-**Gate:** a regional report is produced where no bucket below the k-threshold is
-emitted and no individual report is recoverable by the collector.
-
-### Slice 6 — Resilience + ecosystem
-
-- [ ] Link-type abstraction with per-class policy (satellite / mobile / mesh)
-- [ ] Mesh control-plane store-and-forward on a Meshtastic-class stack
-- [ ] Crovi policy injection; Thump link-class reporting and migration holds
-- [ ] Degradation ladder rungs 6–7
-
-**Gate:** a live demo where the terrestrial link is severed, data plane stops,
-control plane keeps flowing over a mesh link within its real duty-cycle budget,
-and Thump correctly holds a migration instead of attempting it.
-
-### Later — horizontal expansion
-
-Warren DNS, Warren Email, Warren Storage. Not scoped until Slice 3's gate is met;
-a name service over an unproven transport is a demo, not a product.
+**Slice 1 passing is not deployability.** The gate covers the handshake; the shape
+of application traffic after it (§6.4) and relay-pool enumeration (§7.2) are both
+untouched, and a real deployment needs both.
 
 ---
 

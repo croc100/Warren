@@ -1,318 +1,129 @@
 # Changelog
 
-All notable changes to Warren. Newest first.
+Newest first. This file records *why* things changed, since that is the part a diff
+does not keep. Structural decisions live in [`DESIGN.md`](../DESIGN.md) §14 and in
+[`docs/adr/`](adr/).
 
-## 2026-09-28 — L1: the server flight is shaped from a measurement of the borrowed site (ADR 0001 Stage A)
+## 2026-09-28 — L0 and L1 brought up to a measurable standard
 
-`cmd/probe` now reports no distinguisher: the flight is byte-exact against a real
-session to the same site (1196 B in 4 records, plus 500 B in 2 post-handshake
-records, in the local OpenSSL-backed setup), and the record sequence matches.
+Warren went from a proof of concept that compared favourably against itself to two
+layers that hold up against a harness built to break them. The design was re-based
+on the 2026 environment first, then the transport and discovery layers were
+rebuilt to match, with a measurement gate in between.
 
-### Added
+### L1 — transport
 
-- `internal/network/transport/flight.go`: `ProfileSite` performs a genuine TLS
-  handshake with the borrowed site using the same parroted fingerprint a Warren
-  client would, taps it at the record layer, and records the shape of the answer —
-  record sizes, order and pacing, post-handshake records, the size of a real
-  client's Finished, the ServerHello size, and the negotiated key-exchange group
-  read off the wire. `AtomicFlight` holds the current profile so a long-running
-  relay can re-measure without a restart.
-- Shaped records in `aead_conn.go`: every record's plaintext now starts with a kind
-  byte (`data`, `filler`, `confirm`), so the relay can emit records whose purpose is
-  to occupy the space a real server's certificate flight would have used. Filler
-  never reaches a caller's `Read`. This is also the mechanism DESIGN.md §6.4's
-  traffic-shaping regimes will reuse.
-- Key confirmation: the largest flight record carries an HMAC over the session key
-  and the whole transcript, so the client has proof the relay derived the same key
-  before it sends anything, and any rewriting of the ClientHello or ServerHello in
-  transit is detected. The client answers in a Finished-sized record. The
-  confirmation also states how many flight records follow it, so ordering is
-  explicit instead of timed — a timing heuristic would put the client's
-  ChangeCipherSpec in the middle of the server's flight on a slow link.
-- `internal/network/tlsrec`: the record-layer vocabulary, shared by the transport
-  (which shapes records) and the probe harness (which measures them), so the thing
-  measured and the thing measuring cannot disagree about a record boundary.
-- `cmd/node`: measures its fallback site at startup and refuses to run if the site
-  is unusable, re-measures on `-profile-refresh` (default 30 minutes), and
-  `-profile-only` prints a candidate site's shape so an operator can check it
-  before committing. Profiling verifies the site's certificate by default;
-  `-profile-insecure` is for local self-signed sites.
-- `cmd/probe` gained a post-handshake (session ticket) measurement, and its drivers
-  now pause before sending a payload so that window is observable at all.
+- **Hybrid post-quantum session handshake; the static PSK is gone.** The client's
+  ephemeral X25519MLKEM768 key share rides in the parroted ClientHello in the exact
+  layout a real browser uses, and the relay answers with a real-shaped ServerHello
+  carrying the ML-KEM ciphertext. Three secrets feed the AEAD key: ML-KEM-768
+  (recorded traffic stays unreadable later), ephemeral X25519 (forward secrecy), and
+  an exchange with the relay's long-term identity key (authentication). Clients hold
+  only a relay's public key, so a compromised client reveals nothing about any other
+  session, and seizing a relay key does not decrypt earlier recordings.
+- **The server flight is shaped from a live measurement of the borrowed site.** A
+  real TLS 1.3 server follows its ServerHello with kilobytes of encrypted
+  certificate messages and then session tickets; sending nothing there is separable
+  on record sizes alone. A constant could not fix it — Go emits one record per
+  handshake message, OpenSSL coalesces several, chains differ by kilobytes, ticket
+  counts differ again — so `ProfileSite` measures the site and the relay replays its
+  shape, re-measuring on a schedule because certificates rotate. The records carry
+  Warren's key confirmation (an HMAC over the session key and the whole transcript)
+  rather than padding, and the confirmation states how many records follow it, so
+  ordering is explicit instead of timed.
+- **Consequences that are now enforced:** a relay with no usable profile refuses to
+  serve, and a site that does not negotiate `X25519MLKEM768` is rejected as cover,
+  because Warren's ServerHello is hundreds of bytes larger than such a site's would
+  be. `node -profile-only` exists so an operator can check a candidate first.
+- **Replay cache.** The tag is a function of the hello, so a verbatim replay would
+  validate by construction; a repeat is now spliced to the real site, closing the
+  "replay one recording to confirm a relay" probe.
+- **Framing.** Application data is TLS `application_data` records with the header
+  authenticated as associated data, replacing a bespoke 4-byte length prefix. Every
+  record's plaintext starts with a kind byte, which is what makes filler invisible
+  to callers — the mechanism the traffic-shaping regimes will reuse.
+- **Camouflage profile tracks a current browser** (`HelloChrome_Auto`), with a CI
+  guard asserting the active profile still offers a hybrid post-quantum key share.
+  A 2023 parrot is a distinguisher in 2026, not a disguise.
 
-### Why not a hardcoded pad
+### L0 — discovery
 
-How a server's flight looks is a property of the site and its TLS stack: Go emits
-one record per handshake message, OpenSSL coalesces several, certificate chains
-differ by kilobytes between sites, ticket counts differ again. A constant would have
-made every Warren relay look like the same server that doesn't exist — a positive
-signature rather than an absence, which is worse than the gap it replaced.
+- **Signed, expiring bridge descriptors** (`warren-bridges/1`), one whitespace-free
+  line so any text channel carries them. The Ed25519 signature covers the literal
+  wire prefix, never a re-serialization of parsed fields, because verifying a
+  re-encoding is a well-worn way to ship a signature bypass; unknown fields are
+  rejected. This reduces a hostile channel from a redirection to a denial of
+  service, since each relay's identity key is inside the signed payload.
+- **File and DNS resolvers fail closed without a trust anchor.** Those are the two
+  cheapest places for a censor to put its own list. `StaticResolver` needs none: its
+  bridges arrived inside the client binary.
+- **Expiry is a reported state, not an error.** An expired descriptor still yields
+  bridges, marked stale, and fresh copies win; treating expiry as fatal would let a
+  censor strand clients by blocking every channel for a week.
+- `cmd/bootstrap` replaces its placeholder with `-genkey`, `-sign`, `-verify`.
 
-### Changed
+### Measurement
 
-- A relay **refuses to serve without a usable flight profile**, and a profile that
-  does not negotiate `X25519MLKEM768` is rejected. Warren's ServerHello carries a
-  1120-byte hybrid key share, so a site negotiating classical X25519 answers with a
-  ServerHello hundreds of bytes smaller — pairing with it would make the first
-  server packet a distinguisher. Site selection is now a machine-checkable step.
-- The probe harness's self-test flipped: it used to assert the harness *detected*
-  the missing flight, which was the right assertion while the gap existed and is why
-  the harness was built first. It now asserts the shapes match.
+- **`internal/network/probe` + `cmd/probe`, the gate.** It taps a Warren session
+  and a real TLS session to the same borrowed site, compares record shape, and runs
+  six active probes (browser-shaped handshake with certificate inspection, two
+  sequential handshakes, plaintext HTTP, record-shaped junk, a truncated hello, and
+  a replay of a captured genuine ClientHello) against both endpoints. It exits
+  non-zero on any distinguisher.
+- Its own self-test first asserted that it *detected* the known missing certificate
+  flight — a harness that cannot find a defect you already know about is not
+  evidence of anything — and now asserts the shapes match, which was Stage A's
+  definition of done.
+- `internal/network/tlsrec` holds the record-layer vocabulary both the transport
+  and the harness use, so the thing measured and the thing measuring cannot
+  disagree about a record boundary.
 
-### Fixed
+### Defects the harness found, all fixed
 
-- **uTLS parses a ClientHello zero-copy**, so the parsed hello pointed into the
-  `bufio` buffer the record was peeked from, and later reads on that reader
-  overwrote those bytes. The tag check runs before any further read and was fine,
-  but the new key confirmation is computed after the client's own records arrive, at
-  which point "client random" and "client share" were whatever had landed most
-  recently. It presented as an intermittent confirmation failure that vanished
-  under a debug print. The parse now takes copies.
+1. **The parroted ClientHello was ~250 bytes short of its own profile.**
+   `PubClientHelloMsg.Marshal()` drops extensions that live only in
+   `uconn.Extensions`, which for a current Chrome profile includes the GREASE ECH
+   block. A first-packet size distinguisher, invisible to unit tests that compare
+   Warren against itself.
+2. **TCP teardown used FIN where the real site sends RST.** Separable on teardown
+   alone, no TLS analysis needed. A Go-backed test site hid it; an OpenSSL-backed
+   one exposed it — the reference site has to be representative.
+3. **uTLS parses a ClientHello zero-copy**, so the parsed hello pointed into the
+   `bufio` buffer the record was peeked from and later reads overwrote those bytes.
+   Harmless until the key confirmation started reading the transcript after the
+   client's own records had arrived; it presented as an intermittent failure that
+   vanished under a debug print.
 
-## 2026-09-28 — L1 gate: active-probe and record-shape harness (ADR 0001 Stage 0)
+### Design
 
-### Added
+Re-based on the 2026 environment: deployed allowlist regimes and national
+shutdowns, throttling instead of blocking, statistical classification,
+post-quantum TLS as the common case, and client-distribution and operator-liability
+chokepoints. Transports became pluggable with an explicit degradation ladder; node
+types collapsed to client/relay/exit with relay ≠ exit as a safety property; exit
+abuse containment became a blocking requirement; settlement left the critical path.
 
-- `internal/network/probe` + `cmd/probe`: taps a genuine Warren session and a
-  real TLS session to the same borrowed site, compares record shape (server
-  flight after ChangeCipherSpec, record-type sequence, ClientHello and
-  ServerHello sizes), and runs an active probe suite against both endpoints —
-  browser-shaped handshake with certificate inspection, two sequential
-  handshakes, plaintext HTTP, record-shaped junk, a truncated hello, and a replay
-  of a captured genuine ClientHello. Exits non-zero on any distinguisher, so it
-  can gate a release.
-- A harness self-test asserting it *does* detect the known missing certificate
-  flight. A measurement tool that cannot find a defect we already know about is
-  not evidence of anything; when Stage A lands, that test's expectation flips.
+Retired, with reasons in [`DESIGN.md` §14](../DESIGN.md#14-deprecated-decisions):
+the on-chain per-event Independence Logger (replaced by threshold-aggregated
+telemetry over Oblivious HTTP), public on-chain bandwidth listings, a bespoke
+bonded-relayer gas scheme, libsnark, L1-mainnet settlement, and a
+`Starlink.EstablishTunnel` API that does not exist. Factual corrections: LoRa
+control-plane capacity was overstated by one to two orders of magnitude, and the
+failover "health" formula was unbounded yet compared against 0.6.
 
-### Fixed — both found by the harness on its first run
+[ADR 0001](adr/0001-borrowed-tls-handshake.md) records how L1's mimicry gap is
+being closed — measurement first, then shape, and a relayed real handshake only if
+measurement demands it — and why xray-core's `reality` stays a reference
+implementation rather than a dependency.
 
-- **ClientHello was ~250 bytes short of the profile it parroted.**
-  `PubClientHelloMsg.Marshal()` only emits extensions it knows about and drops
-  everything that lives solely in `uconn.Extensions` — for a current Chrome
-  profile that includes the GREASE ECH block. Now marshaled through
-  `UConn.MarshalClientHello()`, with the key share patched in the
-  `KeyShareExtension` where the wire bytes actually come from. This was a
-  first-packet size distinguisher, invisible to unit tests that compare Warren
-  against itself.
-- **TCP teardown used FIN where the real site sends RST.** A real HTTPS server
-  handed plaintext HTTP aborts the connection; the relay spliced the site's bytes
-  faithfully and then closed cleanly, which is separable on teardown alone with no
-  TLS analysis. The splice now mirrors an upstream reset. A Go-backed test site
-  hid this (it closes cleanly); an OpenSSL-backed site exposed it.
+### Repository
 
-### Notes
-
-- Comparison thresholds tolerate a profile's own variance: a current Chrome hello
-  moves in 32-byte steps across a ~100-byte band because of the GREASE ECH
-  payload, and a harness that reports that as a finding is one people stop
-  reading.
-- `cmd/probe` currently reports two distinguishers against a local OpenSSL-backed
-  site — the missing certificate flight and the record sequence that follows from
-  it. That is the same defect twice and is exactly what ADR 0001 Stage A
-  addresses, which is now the next implementation task.
-
-## 2026-09-28 — ADR 0001: how L1's handshake-mimicry gap gets closed
-
-Decision recorded in [`docs/adr/0001-borrowed-tls-handshake.md`](adr/0001-borrowed-tls-handshake.md).
-
-Writing it up surfaced that the gap is worse than the previous notes said: it is
-**passively** detectable. A real TLS 1.3 server follows its ServerHello with a
-2–6 KB encrypted certificate flight, Warren sends nothing there, and a classifier
-needs only record sizes and directions to notice — no decryption, no Warren
-client. The transport is therefore documented as not safe against a live
-adversary until this is fixed, in the README, DESIGN and protocol notes.
-
-The decision is to close it in stages rather than to pick between the two options
-previously on the table (import xray-core's `reality`, or hand-roll the full
-borrowed handshake):
-
-- **Stage 0** — build the active-probe and record-shape harness first. It is
-  already Slice 1's gate, and no version of this decision is evaluable without it.
-- **Stage A** — emit shape-accurate synthetic records where a real server's
-  certificate flight would be, sized from the borrowed site's own flight. TLS 1.3
-  encrypts that flight, so a passive observer can only measure shape, and an
-  active prober is already spliced to the real site — which is why padding buys
-  most of the defence at a fraction of the cost.
-- **Stage B** — relay the real handshake only if measurement shows Stage A is
-  still separable, or if a target region deploys TLS-intercepting middleboxes.
-
-The mimicry-versus-post-quantum trade-off turned out to be a false choice: nest
-the layers and the outer borrowed handshake carries shape while the inner hybrid
-handshake carries confidentiality, so no stage gives up ML-KEM. xray-core stays a
-reference implementation and test oracle rather than a dependency (size, coupling,
-X25519-only auth, and MPL-2.0/AGPL-3.0 obligations).
-
-## 2026-09-28 — L0: signed, expiring bridge descriptors
-
-Second Slice 1 item. Bridges no longer travel as bare `addr|sni|pubkey` lines
-over channels a censor can influence.
-
-### Added
-
-- `internal/discovery/bootstrap/descriptor.go`: the `warren-bridges/1`
-  descriptor — one line, whitespace-free, so any text channel can carry it (DNS
-  TXT record, chat message, QR code, printed page):
-  `warren-bridges/1;issued=…;expires=…;bridge=addr|sni|pubkey[;bridge=…];sig=…`
-  with an Ed25519 signature over the literal wire prefix, not a
-  re-serialization of parsed fields. Unknown fields are rejected; the version
-  prefix is how a future format announces itself.
-- `cmd/bootstrap`: `-genkey` (mint the trust anchor; the anchor ships with
-  clients, the signing key stays offline), `-sign`, `-verify`. It replaces the
-  "not yet implemented" placeholder.
-- Staleness as a first-class state: `Descriptor.Stale`, `Bridge.Stale`,
-  `Bridge.Expires`, `Result.Stale`. `Multi` prefers a fresh copy of a relay over
-  a stale one and sorts fresh bridges first; `cmd/cli` warns when it is dialing
-  a stale bridge.
-- Tests: sign/verify round trip, a byte-by-byte tamper sweep over the whole
-  signed payload, a descriptor signed by a different key, missing anchor,
-  unknown field, expiry surfacing as stale rather than fatal, a tampered DNS
-  record costing only itself, and `Multi` refusing to let a stale descriptor
-  override a current one.
-
-### Changed
-
-- `FileResolver` and `DNSResolver` now require `Anchors` and **fail closed**
-  without one. A file and a DNS answer are the two cheapest places for a censor
-  to put its own bridge list, so "no anchor configured" is an error rather than a
-  silent downgrade to trusting the channel. `StaticResolver` still needs no
-  signature: its bridges arrived inside the client binary.
-- `cmd/cli` takes `-trust-anchor` / `WARREN_BRIDGE_ANCHOR_HEX` when reading a
-  bridge file. Explicit `-addr`/`-relay-key` still works for local demos, where
-  the operator is the trust anchor.
-
-### Why expiry is not fatal
-
-A verified but expired descriptor still yields bridges, marked stale. Treating
-expiry as fatal would hand a censor a way to strand clients by blocking every
-discovery channel for a week — the addresses a client already holds may well
-still work, and "discovery is stale" is a different state from "no bridges".
-
-## 2026-09-28 — L1: hybrid post-quantum session handshake, static PSK removed
-
-Slice 1 work from [`docs/ROADMAP.md`](ROADMAP.md). The transport no longer has a
-shared secret, and a recorded session is no longer decryptable by anyone who
-later obtains the relay's key or a quantum computer.
-
-### Added
-
-- `internal/network/transport/handshake.go`: the Warren session handshake, hidden
-  inside the camouflaged TLS flight. The client's ephemeral X25519MLKEM768 key
-  share (ML-KEM-768 encapsulation key ‖ X25519 public key, the real browser
-  layout) rides in the ClientHello; the relay answers with a real-shaped TLS 1.3
-  ServerHello carrying the ML-KEM ciphertext and its own ephemeral X25519 key.
-  Three secrets feed the AEAD key: ML-KEM (post-quantum), ephemeral X25519
-  (forward secrecy), and an exchange with the relay's long-term identity key
-  (authentication).
-- Relay identity keys: `transport.GenerateServerIdentity`, `node -genkey`. The
-  private half never leaves the relay; the public half is published in the bridge
-  descriptor.
-- Bounded replay cache on `client_random`. The tag is a function of the hello, so
-  a verbatim replay would otherwise validate; a repeat is now spliced to the real
-  site, closing the "replay one recording to confirm a relay" probe.
-- `internal/network/transport/record.go`: TLS record-layer framing and helpers.
-- Tests: wrong-relay-key treated as a probe, replayed hello spliced to the real
-  site, segmented ClientHello (137-byte chunks through a fragmenting proxy) still
-  authenticating, client record-type sequence matching a real TLS 1.3 client, and
-  per-connection ephemerality of every secret.
-
-### Changed
-
-- **Removed the static pre-shared key.** `Config.PSK` is gone, replaced by
-  `ServerPublicKey` (client) and `ServerPrivateKey` (relay). Consequences: a
-  compromised client reveals nothing about other sessions; seizing a relay key
-  does not decrypt earlier recordings; and a hostile discovery channel cannot
-  steer a client onto a censor-run relay, because the client cannot authenticate
-  to a relay whose key it was not given.
-- Application data is framed as TLS `application_data` records (`0x17 0x03 0x03`
-  + length) instead of a bespoke 4-byte length prefix, with the record header
-  authenticated as AEAD associated data. The client's wire sequence is now
-  ClientHello → ChangeCipherSpec → application_data, matching a real TLS 1.3
-  client in middlebox-compatibility mode.
-- Bridge descriptors are `addr|sni|pubkey`; a descriptor missing its relay key is
-  skipped as malformed rather than failing later at dial time.
-- `cmd/node` takes `-identity-file` / `WARREN_RELAY_KEY_HEX` and `-genkey`;
-  `cmd/cli` takes `-relay-key` / `WARREN_RELAY_PUBKEY_HEX` or reads the key from
-  the bridge file. `WARREN_PSK_HEX` is gone.
-- Server-side hello parsing now peeks the complete record and parses it with
-  uTLS rather than reading fixed offsets, which is what makes a segmented
-  ~1.5 KB hybrid hello a non-issue.
-
-### Known gaps
-
-- The flight after the ServerHello is TLS-*shaped*, not a real TLS handshake:
-  no Certificate/Finished. A censor who already holds a valid tag could see that.
-  Either completing a borrowed handshake or adopting xray-core's audited
-  `reality` package is the next decision — upstream REALITY is X25519-only, so
-  adopting it as-is would trade the post-quantum property for the mimicry one.
-- Bridge descriptors are still unsigned, and traffic shaping is unimplemented.
-
-## 2026-09-28 — Design re-based on the 2026 environment
-
-Warren is pre-alpha with two working layers, so this revision optimizes for
-technical merit in the current environment rather than continuity with earlier
-drafts. Full rationale in [`DESIGN.md`](../DESIGN.md); superseded decisions are
-tabulated in [`DESIGN.md` §14](../DESIGN.md#14-deprecated-decisions).
-
-### Changed — transport (code)
-
-- `internal/network/transport`: the camouflage profile is now configurable
-  (`Config.Fingerprint`) and defaults to `DefaultFingerprint` =
-  `utls.HelloChrome_Auto`, instead of a pinned `HelloChrome_120`. A pre-2024
-  browser parrot offers no hybrid post-quantum key share, which makes it a
-  distinguisher against today's real TLS traffic rather than a disguise.
-- Added `TestDefaultFingerprintOffersHybridPQKeyShare` as a staleness guard: it
-  fails if the active profile stops offering `X25519MLKEM768`.
-- Added `TestClientHelloSpansMultipleSegments`, recording that the current
-  profile's hello is ~1.5 KB and therefore will not arrive in one TCP segment on
-  a real network.
-
-### Changed — design
-
-- Threat model updated for deployed allowlist regimes, national shutdowns,
-  throttling-instead-of-blocking, statistical classification, post-quantum TLS
-  as the common case, and client-distribution/operator-liability chokepoints.
-- Transport re-specified as pluggable (`tls-borrow`, `masque` per RFC 9298/9484,
-  `websocket-tunnel`, `rendezvous`) with an explicit degradation ladder.
-- Traffic shaping re-specified as three costed regimes (`off` / `bucket` /
-  `cover`); always-on constant-rate cover traffic is removed as unbudgeted and
-  self-contradictory under per-GB billing.
-- Node taxonomy reduced from five types to three roles (client / relay / exit),
-  with relay ≠ exit as a safety property.
-- Abuse containment and exit-operator liability added as a blocking requirement.
-- Settlement moved off L1 mainnet and out of the critical path: the core works
-  with settlement disabled; optional on-chain settlement is L2, net-balance only,
-  with no public listing surface.
-- Access control moved from a bespoke ZK nullifier scheme to Privacy Pass
-  (RFC 9576–9578) unlinkable tokens.
-- Satellite/mesh re-specified as a link type with per-traffic-class policy.
-- Roadmap replaced month numbers with falsifiable per-slice gates.
-
-### Removed
-
-- On-chain per-event Independence Logger, replaced by opt-in threshold-aggregated
-  telemetry (Prio/STAR-class) over Oblivious HTTP. An immutable public record of
-  "circumvention happened in region R at time T" is a liability the analytics
-  product does not need.
-- Public on-chain bandwidth listings — a permanent, browsable directory of
-  residential relays is a censor's blocklist.
-- Bespoke bonded-relayer gas payment (ERC-4337 / EIP-7702 cover this).
-- libsnark (unmaintained); gnark/Noir-class tooling if ZK is needed at all.
-- `Starlink.EstablishTunnel`-style API integration — no such consumer API exists.
-
-### Fixed — factual errors in the design
-
-- LoRa control-plane capacity was overstated by 1–2 orders of magnitude
-  ("~500 messages/second"); duty-cycle limits put the real budget at single-digit
-  messages per minute, which changes the control plane to store-and-forward.
-- The failover "health" formula was unbounded yet compared against `0.6`;
-  re-specified as normalized [0,1] with hysteresis.
-- Retired Ethereum testnets (Goerli/Holesky) replaced with Sepolia/Hoodi.
-- "Amazon Kuiper" renamed to its commercial brand, Amazon Leo.
-- README no longer advertises installers, packages, binary releases, or a 10 Gbps
-  hardware requirement that do not exist.
+The aspirational directory skeleton (95 empty placeholder directories, four
+`not yet implemented` command stubs, and empty Solidity sketches for a design that
+has since changed) was deleted. A tree that implies capability is its own kind of
+dishonesty, and `DESIGN.md` already says what will live where.
 
 ## Earlier
 
-- L0 bootstrap + L1 REALITY-lite camouflage implemented and tested (`adbf189`).
-- Initial project structure and design documents.
+Initial project structure, and the first L0 bootstrap plus REALITY-lite camouflage
+proof of concept.

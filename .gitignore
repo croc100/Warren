@@ -1,6 +1,4 @@
 bin/
-logs/
-data/
 
 # local-only notes (business/pricing/etc), never pushed
 *.local.md

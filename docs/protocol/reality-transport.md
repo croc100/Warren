@@ -1,7 +1,7 @@
 # L0 + L1: Discovery, Camouflage, and the Session Handshake
 
 This document covers the two lowest layers of Warren's stack, described in
-[DESIGN.md](../../DESIGN.md#anti-blocklisting-defense-model):
+[DESIGN.md](../../DESIGN.md#7-l2--relay-pool-routing--abuse-containment):
 
 - **L0 — Discovery/bootstrap** (`internal/discovery/bootstrap`): how a client
   finds a working relay without depending on one blockable endpoint.
