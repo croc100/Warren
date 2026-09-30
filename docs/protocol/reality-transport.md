@@ -35,8 +35,10 @@ Two things ride inside the hello:
 
 1. **A 16-byte authentication tag** in the `session_id` field (padded to the
    usual 32 bytes so the field length isn't a tell), derived as
-   `HMAC-SHA256(ss_auth, "warren-tag-v1" || client_random || client_share)`
-   where `ss_auth = X25519(client_ephemeral, relay_identity_public)`.
+   `HMAC-SHA256(ss_auth, "warren-tag-v2" || client_random || client_share || window)`
+   where `ss_auth = X25519(client_ephemeral, relay_identity_public)` and `window`
+   is a coarse clock (see **Replay** below). The window is an input to the HMAC,
+   never a field, so the hello's size and structure are unchanged.
 2. **The client's own ephemeral hybrid key share** — an ML-KEM-768
    encapsulation key followed by an X25519 public key (1216 bytes), byte-for-byte
    the layout a real browser sends for that group, so the hello's size and
@@ -89,6 +91,7 @@ the record layer, and records:
 | Records after the client's Finished | Session-ticket-shaped records after the client's confirmation |
 | The client's Finished record size | How big the Warren client's confirmation record must be |
 | ServerHello size | A sanity check against Warren's own (~1210 B with a hybrid share) |
+| How long the site took to answer the ClientHello | How long the relay waits before sending its own ServerHello |
 | The negotiated key-exchange group, read off the wire | Whether this site is usable as cover at all |
 
 That last row is a security decision, not bookkeeping. Warren's ServerHello carries
@@ -127,6 +130,46 @@ right.
   shape, and the relay would then faithfully imitate a server that doesn't exist.
   `-profile-insecure` exists for local, self-signed test sites.
 
+## Answering no faster than the site
+
+A relay has two ways of answering and they cost structurally different amounts
+of time. A client holding a valid tag is answered out of local state: an X25519
+exchange and an ML-KEM encapsulation, microseconds. Everyone else is spliced,
+which costs a fresh TCP connection to the borrowed site plus that site's own
+answer time — a round trip, so tens of milliseconds for any site worth
+borrowing from.
+
+Left alone, connections to one relay address split into two clearly separated
+latency modes, and a real web server does not answer some handshakes in a
+microsecond and the rest in 80 ms. Nothing needs decrypting to see it: an
+observer timing ClientHello to ServerHello has a clock and that is all it needs.
+It is the cheapest distinguisher on the list and it survived every shape
+measurement, because shape was only ever measured in bytes.
+
+So `ProfileSite` records how long the borrowed site takes to answer, and the
+relay waits that out before its own ServerHello. Two details matter:
+
+- **The wait is measured from the hello's arrival, not from after the key
+  exchange.** Otherwise the relay answers consistently *later* than the site it
+  imitates, which is the same distinguisher pointing the other way, and one that
+  grows under load.
+- **It is capped.** The borrowed site is not under the relay's control, and a
+  measurement taken across a bad moment — or against a site deliberately slowed
+  by someone who noticed it is being borrowed — must not turn every handshake
+  into a stall.
+
+Without the wait, a relay answered in 510 µs where the site it imitates took
+150 ms.
+
+**This narrows the gap; it does not close it.** The splice still pays one round
+trip more than the Warren path, because it has to open a TCP connection that the
+profile's measurement — taken after its own connect — does not include. So
+`cmd/probe` captures a third session, unauthenticated and against the relay, and
+reports the two paths side by side as `answer latency, both paths`. The residual
+is measured rather than assumed, and on a real deployment with a remote borrowed
+site the gate will report it. Closing it needs either warm upstream connections
+or waiting out the connect as well; both are in the roadmap's hardening backlog.
+
 ## The session handshake
 
 Three shared secrets go into the AEAD key:
@@ -159,12 +202,42 @@ A relay generates its identity with `node -genkey`; the public half is published
 in the bridge descriptor (`addr|sni|pubkey`), the private half never leaves the
 relay.
 
-**Replay.** Because the tag is a function of the hello, a captured hello
-re-sent verbatim validates by construction. The relay therefore keeps a bounded
-replay cache of recently-seen `client_random` values (10-minute TTL) and treats
-a repeat exactly like an unauthenticated connection: spliced to the real site.
-Without this, a censor could confirm a suspected relay by replaying one
-recorded hello and noticing the response differs from the real site's.
+**Replay.** Because the tag is a function of the hello, a captured hello re-sent
+verbatim validates by construction, so a censor could confirm a suspected relay
+by replaying one recording and noticing the answer differs from the real site's.
+Two mechanisms stop that, and the first is what makes the second affordable.
+
+*The tag carries a coarse clock.* It covers a 10-minute window index alongside
+the random and the key share, and a relay accepts its own window and the two
+adjacent ones. A captured hello therefore stops verifying about half an hour
+after it was minted — bounded by arithmetic rather than by how much the relay
+can afford to remember.
+
+A cache alone could never have given this. A cache is a memory budget and every
+memory budget expires; before the window existed, a censor holding one captured
+hello only had to wait out the TTL, and waiting is free. The cache's TTL *was*
+the lifetime of the defence.
+
+*The relay remembers recent randoms.* Inside the acceptance span the tag is
+still valid, so something has to refuse a repeat: a set of `client_random`
+values kept in generations that rotate. A repeat is treated exactly like an
+unauthenticated connection and spliced to the real site. Retention is sized to
+the acceptance span and no further, because beyond it the tag no longer verifies
+and there is nothing left worth remembering.
+
+At its ceiling the cache retires its oldest generation. The previous version
+emptied itself instead, so a relay busy enough to fill it inside one TTL
+periodically forgot everything and ran with no replay protection until it
+refilled — a cliff that appears on a relay that is doing well, not one under
+attack.
+
+*What it costs.* A client whose clock is wrong by more than the slack cannot
+connect, and cannot be told why: an out-of-window tag has to be answered exactly
+like a forged one, or the difference between those two answers becomes the
+distinguisher. From the client's side that looks like censorship, which is why
+`Dial` fails with `ErrRelayRejected` — naming the clock alongside a wrong or
+rotated relay key — rather than surfacing the raw AEAD failure that being
+spliced actually produces.
 
 ## L0: signed descriptors over multiple channels
 
@@ -295,6 +368,12 @@ machine finds at the worst moment. Fixed by having the parse take copies.
 - **No rotating per-requester subsets.** Discovery currently hands out whatever
   a channel holds; anti-enumeration (rotating subsets, token-rate-limited
   requests) is L2 work (DESIGN.md §7.2).
+- **One round trip still separates the relay's two answer paths.** The wait
+  before the ServerHello equalises the site's answer time but not the TCP
+  connect the splice additionally pays, so a genuine Warren session is answered
+  roughly one relay-to-site round trip sooner than a spliced one. `cmd/probe`
+  measures and reports this rather than hiding it; it is a real signal to an
+  observer with enough samples from one address.
 - **Sniff latency on short, non-ClientHello-shaped input.** A connection whose
   record header claims more bytes than it ever sends waits out the 5-second
   sniff deadline before falling through. Real HTTPS clients are unaffected;

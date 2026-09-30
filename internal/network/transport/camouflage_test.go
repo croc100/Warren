@@ -7,8 +7,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"runtime"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -60,6 +61,14 @@ func testFlight() *FlightProfile {
 
 func startRelay(t *testing.T, handle Handler) (addr string, clientCfg Config) {
 	t.Helper()
+	return startRelayWithFlight(t, handle, testFlight())
+}
+
+// startRelayWithFlight is startRelay with the borrowed site's measured shape
+// supplied by the caller, for tests that care about what the relay does with a
+// particular measurement rather than about the handshake in general.
+func startRelayWithFlight(t *testing.T, handle Handler, flight *FlightProfile) (addr string, clientCfg Config) {
+	t.Helper()
 	priv, pub, err := GenerateServerIdentity()
 	if err != nil {
 		t.Fatalf("generate identity: %v", err)
@@ -78,7 +87,7 @@ func startRelay(t *testing.T, handle Handler) (addr string, clientCfg Config) {
 		ServerPrivateKey: priv,
 		FallbackSNI:      "www.example.com",
 		FallbackAddr:     startFallbackEcho(t),
-		Flight:           testFlight(),
+		Flight:           flight,
 	}
 	go Serve(ctx, ln, relayCfg, handle)
 
@@ -339,13 +348,14 @@ func TestEphemeralSecretsDifferPerConnection(t *testing.T) {
 	clientRandom := make([]byte, 32)
 	rand.Read(clientRandom)
 	sessionID := make([]byte, sessionIDLen)
-	copy(sessionID, deriveTag(first.authSS, clientRandom, first.share))
+	now := time.Now()
+	copy(sessionID, deriveTag(first.authSS, clientRandom, first.share, tagWindowIndex(now)))
 
-	acceptA, err := serverAccept(priv, clientRandom, sessionID, first.share)
+	acceptA, err := serverAccept(priv, clientRandom, sessionID, first.share, now)
 	if err != nil {
 		t.Fatalf("serverAccept: %v", err)
 	}
-	acceptB, err := serverAccept(priv, clientRandom, sessionID, first.share)
+	acceptB, err := serverAccept(priv, clientRandom, sessionID, first.share, now)
 	if err != nil {
 		t.Fatalf("serverAccept: %v", err)
 	}
@@ -357,7 +367,7 @@ func TestEphemeralSecretsDifferPerConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate identity: %v", err)
 	}
-	if _, err := serverAccept(otherPriv, clientRandom, sessionID, first.share); err == nil {
+	if _, err := serverAccept(otherPriv, clientRandom, sessionID, first.share, now); err == nil {
 		t.Fatal("a relay holding a different identity key validated the tag")
 	}
 }
@@ -565,7 +575,62 @@ func TestSpliceMirrorsUpstreamReset(t *testing.T) {
 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, err = io.ReadFull(conn, make([]byte, 16))
-	if !errors.Is(err, syscall.ECONNRESET) {
-		t.Fatalf("got %v, want ECONNRESET mirrored from the upstream site", err)
+	if !isConnReset(err) {
+		t.Fatalf("got %v, want a reset mirrored from the upstream site", err)
+	}
+}
+
+// TestIsConnReset_RecognisesARealReset is a self-check on the predicate the
+// mirroring depends on, and it is the reason this file no longer compares
+// against syscall.ECONNRESET directly.
+//
+// The teardown mirroring above is only as good as its ability to notice a
+// reset, and that noticing is platform-specific: on Windows a peer reset
+// arrives as WSAECONNRESET while syscall.ECONNRESET is a synthetic value no
+// socket returns, so the original check matched nothing there and every spliced
+// connection closed with a FIN against a site that sends RST. The assertion
+// itself carried the same bug, so it failed loudly instead of silently — on
+// Linux, where both were correct, nothing was visible at all.
+//
+// So the detector gets its own test on whatever platform CI runs.
+func TestIsConnReset_RecognisesARealReset(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		c.Read(make([]byte, 64))
+		if tcp, ok := c.(*net.TCPConn); ok {
+			tcp.SetLinger(0) // the following Close sends an RST
+		}
+		c.Close()
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err = io.ReadFull(conn, make([]byte, 16))
+
+	if err == nil {
+		t.Fatal("read succeeded; the peer was supposed to reset the connection")
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("read timed out rather than seeing the peer's reset: %v", err)
+	}
+	if !isConnReset(err) {
+		t.Fatalf("isConnReset did not recognise a genuine peer reset on %s: %v (%T)", runtime.GOOS, err, err)
 	}
 }

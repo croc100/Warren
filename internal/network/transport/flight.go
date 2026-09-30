@@ -55,6 +55,23 @@ type FlightProfile struct {
 	Group          uint16
 	ServerHelloLen int
 
+	// ServerHelloDelay is how long the borrowed site took to answer a
+	// ClientHello, measured from the relay's own vantage point: one network
+	// round trip to the site plus whatever the site spends choosing parameters
+	// and signing.
+	//
+	// The relay waits this long before its own ServerHello, and that is a
+	// security property rather than cosmetics. A relay has two answer paths and
+	// they have structurally different latencies: a genuine Warren client is
+	// answered from local state in microseconds, while an unauthenticated
+	// connection is spliced, which costs a fresh TCP dial to the borrowed site
+	// and the site's own answer time. Unequalized, connections to one relay IP
+	// split into two visibly separate latency modes — some answered instantly,
+	// the rest tens of milliseconds later — and a real web server does not do
+	// that. It needs no decryption and no Warren client to see; a passive
+	// observer timing ClientHello to ServerHello is enough.
+	ServerHelloDelay time.Duration
+
 	// ServerFlight is the server's records between its ChangeCipherSpec and the
 	// client's Finished; PostClientFlight is what it sends afterwards, which is
 	// where session tickets live.
@@ -81,6 +98,14 @@ const (
 	maxShapedFlightDelay = 2 * time.Second
 	minConfirmationBytes = 8
 	maxFlightRecords     = 64
+
+	// maxServerHelloDelay caps the wait before the relay's own ServerHello.
+	// A borrowed site that is briefly slow, or one measured across a bad
+	// moment, must not turn every Warren handshake into a stall — and a
+	// connection held open waiting is a connection an attacker did not have to
+	// pay for. Half a second is well past any plausible intercontinental round
+	// trip to a healthy site.
+	maxServerHelloDelay = 500 * time.Millisecond
 )
 
 // ProfileOptions tunes a measurement run.
@@ -212,10 +237,16 @@ func (t *profilingTap) profile(addr, sni string) (*FlightProfile, error) {
 
 	// The client's Finished is its first application_data record; everything the
 	// server sent before that is its handshake flight, everything after is
-	// post-handshake (tickets).
-	var clientFinishedAt time.Duration
-	found := false
+	// post-handshake (tickets). The client's *first* record is its ClientHello,
+	// and the gap from there to the ServerHello is how long this site takes to
+	// answer — the latency the relay has to reproduce.
+	var clientFinishedAt, clientHelloAt time.Duration
+	found, sawHello := false, false
 	for _, r := range t.fromClient {
+		if !sawHello && r.Type == tlsrec.Handshake {
+			clientHelloAt = r.At
+			sawHello = true
+		}
 		if r.Type == tlsrec.ApplicationData {
 			p.ClientFinishedLen = r.Len
 			clientFinishedAt = r.At
@@ -226,6 +257,9 @@ func (t *profilingTap) profile(addr, sni string) (*FlightProfile, error) {
 	if !found {
 		return nil, errors.New("transport: profiling saw no client Finished record")
 	}
+	if !sawHello {
+		return nil, errors.New("transport: profiling saw no ClientHello record")
+	}
 
 	var prev time.Duration
 	sawCCS := false
@@ -233,6 +267,7 @@ func (t *profilingTap) profile(addr, sni string) (*FlightProfile, error) {
 		switch {
 		case r.Type == tlsrec.Handshake && p.ServerHelloLen == 0:
 			p.ServerHelloLen = r.Len
+			p.ServerHelloDelay = clamp(r.At-clientHelloAt, 0, maxServerHelloDelay)
 			prev = r.At
 		case r.Type == tlsrec.ChangeCipherSpec:
 			sawCCS = true
@@ -329,8 +364,9 @@ func (p *FlightProfile) TotalServerFlight() int {
 
 func (p *FlightProfile) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s (%s): group 0x%04x, ServerHello %d B, flight %d B in %d records",
-		p.Site, p.SNI, p.Group, p.ServerHelloLen, p.TotalServerFlight(), len(p.ServerFlight))
+	fmt.Fprintf(&b, "%s (%s): group 0x%04x, ServerHello %d B after %s, flight %d B in %d records",
+		p.Site, p.SNI, p.Group, p.ServerHelloLen, p.ServerHelloDelay.Round(time.Millisecond),
+		p.TotalServerFlight(), len(p.ServerFlight))
 	if len(p.PostClientFlight) > 0 {
 		post := 0
 		for _, r := range p.PostClientFlight {

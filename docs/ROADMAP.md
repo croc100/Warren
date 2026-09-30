@@ -42,7 +42,7 @@ when a month ends.
 
 ---
 
-## Slice 1 — L1 transport hardening 🚧
+## Slice 1 — L1 transport hardening ✅ (gate passing)
 
 The layer everything else depends on. If a connection can be detected or probed,
 no amount of marketplace or analytics matters.
@@ -83,6 +83,22 @@ no amount of marketplace or analytics matters.
   against a real session by `cmd/probe`. A relay with no usable profile refuses to
   serve, and a site that doesn't negotiate `X25519MLKEM768` is rejected as cover
   because its real ServerHello is hundreds of bytes smaller than Warren's
+- ✅ Answer timing equalised: `ProfileSite` measures how long the borrowed site
+  takes to answer a ClientHello, and the relay waits that out before its own
+  ServerHello. Without it a relay answered in 510 µs where its site took 150 ms,
+  so one relay address showed two latency modes — the cheapest distinguisher
+  there is, needing only a clock. **Partial:** the splice still pays one extra
+  round trip, which `cmd/probe` now measures and reports rather than hides
+- ✅ Replay defence no longer bounded by memory: the tag covers a coarse time
+  window, so a captured hello expires on its own instead of becoming valid again
+  once the cache forgets it. The cache is generational, so filling it retires the
+  oldest entries rather than all of them
+- ✅ Canaries on the gate (`internal/network/probe/canary_test.go`, plus a
+  failure-path step in `hack/smoke.sh`). Every other test asserts the harness
+  finds nothing, which is also what a broken harness reports; these require it to
+  fail against relays that are deliberately wrong. The first run found the
+  post-handshake tolerance wide enough to accept a relay sending no session
+  tickets at all
 - ⬜ Relayed real handshake nested inside the hybrid session (Stage B), only if
   the harness shows Stage A is still separable. The mimicry-versus-post-quantum
   trade-off was a false choice: the outer borrowed handshake carries shape, the
@@ -98,6 +114,69 @@ the flight byte-exact.
 What the gate does **not** cover, and why Slice 1 passing is not deployability:
 the shape of application traffic after the handshake (Slice 2) and relay-pool
 enumeration (Slice 3).
+
+---
+
+## Hardening backlog
+
+Work that does not gate a slice but is owed. Ordered by what an adversary gets
+from it, not by effort. Items marked **found** came out of the hardening pass on
+2026-10-01 and are defects in shipped code rather than unbuilt features.
+
+### Distinguishers still on the table
+
+| # | Item | Why it matters |
+|---|------|----------------|
+| H1 | **Traffic shape after the handshake** (`bucket`/`cover`, DESIGN §6.4) | The largest measured gap. The machinery exists — every record carries a kind byte and filler is already discarded by the peer — so this is a policy layer over tested code, not a new wire format. Slice 2 |
+| H2 | **The gate stops measuring where the handshake ends** | `cmd/probe` compares handshake shape and now answer timing; it does not compare the data phase against the borrowed site's real responses. Slice 1's PASS is routinely misread as deployability because of this |
+| H3 | **One round trip still separates the relay's two answer paths** — *found* | The ServerHello wait equalises the site's answer time but not the TCP connect the splice additionally pays. Fix is warm upstream connections (better: keeps Warren fast) or measuring from dial (simpler: makes Warren slower). Measured and reported by `cmd/probe` today |
+| H4 | **The relay hardcodes its ServerHello cipher suite** — *found* | `tls13CipherSuite` is pinned to `TLS_AES_128_GCM_SHA256`, and the profile never records what the borrowed site actually negotiated. Against a site preferring AES-256 or ChaCha20, a tagged client and a spliced probe get *different* cipher suites from the same relay. It names nothing about how Warren really encrypts, so echoing the measured value is free |
+| H5 | **The splice ignores the ClientHello's SNI** — *found* | The code always dials `FallbackAddr`; the package comment and the README both say it splices to the site the SNI names. A probe presenting an unexpected SNI gets a certificate for the wrong name. Fix the behaviour or the claim, and add the probe case either way |
+| H6 | **No session rekey** | One ChaCha20-Poly1305 key for the whole connection, no record-count limit, no KeyUpdate equivalent. TLS 1.3 rekeys; a long-lived tunnel should too |
+
+### Resource and failure behaviour
+
+| # | Item | Why it matters |
+|---|------|----------------|
+| H7 | **No connection limits anywhere** — *found* | One goroutine per accept, and every unauthenticated connection opens a fresh TCP connection to the borrowed site. That makes the relay an amplifier pointed at a site it does not own, and it is the direct cause of DESIGN §15's first open problem, "what happens when a borrowed site starts rejecting the relay". Any limit has to degrade the way an overloaded real site does, or the limit is itself the distinguisher |
+| H8 | **Silent failure when the borrowed site is unreachable** — *found* | The splice returns and closes with a FIN, so a relay whose cover site is down behaves visibly unlike that site. Refusing to serve is the consistent answer |
+| H9 | **Replay protection does not survive a restart** | Accepted, and worth stating; the exposure is bounded by the tag's window now rather than open-ended |
+
+### Discovery and descriptors (while the format is still v1)
+
+| # | Item | Why it matters |
+|---|------|----------------|
+| H10 | **No revocation** | A relay whose identity key is compromised cannot be withdrawn before its descriptor expires |
+| H11 | **No `not-before` check; duplicate fields silently take the last value** | Parsing happens after signature verification so neither is exploitable today, but both are the kind of thing that becomes exploitable the moment anything around them changes |
+| H12 | **No transport field** | §6.3's `masque` / `websocket-tunnel` / `rendezvous` cannot be expressed in `addr|sni|pubkey`. Slice 2 needs this, and a v1 format cannot carry it |
+| H13 | **Signature agility** | Ed25519 only, while the crypto inventory already plans an ML-DSA-65 hybrid. The version prefix is currently the only escape hatch |
+| H14 | **Anchor rotation is undocumented** | Multiple anchors are supported in code with no story for how one is retired |
+| H15 | **DNS discovery uses the OS resolver in the clear** | The signature protects integrity, not the fact that this client looked up the bridge domain. The query itself is a tell; DoH/DoT is the answer |
+
+### Client
+
+| # | Item | Why it matters |
+|---|------|----------------|
+| H16 | **No failover across bridges, no ladder reporting** | Slice 2's gate requires a client to report which rung of the degradation ladder it is on. Nothing reports anything today |
+| H17 | **Clock dependence is now a reachability risk** | The tag's freshness window means a badly-skewed device is silently unreachable. `ErrRelayRejected` names the clock as a cause; nothing yet helps a client establish the time safely (DESIGN §15) |
+
+### Testing and CI
+
+| # | Item | Why it matters |
+|---|------|----------------|
+| H18 | **CI runs Linux only** — *found the hard way* | TCP teardown mirroring was dead on Windows for as long as this was true: a peer reset arrives as `WSAECONNRESET`, while `syscall.ECONNRESET` on Windows is a synthetic value no socket returns, so a Windows relay closed every spliced connection with a FIN against a site sending RST. Windows is what most of the residential pool this design bets on would run. A build matrix is not a nicety here |
+| H19 | **The gate's stand-in site is Go-backed, and a Go-backed site once hid a real defect** | `hack/smoke.sh` says so in its own comments: the RST distinguisher was invisible against Go and visible against OpenSSL. CI therefore runs the weaker of the two. Add an OpenSSL/BoringSSL-backed site, skipped where the local build lacks ML-KEM |
+| H20 | **No fuzz targets** | Every attacker-facing parser is unfuzzed: `peekClientHello`, `parseServerHelloParts`, `parseConfirmPayload`, `parseDescriptorPayload`, `ParseBridge`. Go's native fuzzing with a CI seed corpus is the cheapest high-value item on this list |
+| H21 | **No `staticcheck`, no `govulncheck`, no reproducible-build target** | Slice 2 explicitly requires reproducible builds and signed artifacts; none of the scaffolding exists |
+| H22 | **`make fmt` cannot run on Windows** — *found* | `gofmt -l` reports every file on a CRLF checkout, which is every Windows clone, so a Windows contributor gets a wall of false positives and learns to ignore the check |
+
+### Documentation and process
+
+| # | Item | Why it matters |
+|---|------|----------------|
+| H23 | **No `SECURITY.md`** | `CONTRIBUTING` has a section, but without the top-level file GitHub shows no reporting path — on a project whose stated most-wanted contribution is adversarial |
+| H24 | **No relay operator guide** | How to choose a site to borrow, what that site's operator sees (a handshake every 30 minutes, plus a connection per probe), and what abuse handling is expected. §7.4 is logged as a requirement with nothing written against it |
+| H25 | **"~5,500 lines" is hardcoded in four documents** | A drift magnet. Say it once, or derive it |
 
 ---
 

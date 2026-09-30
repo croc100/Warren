@@ -29,6 +29,20 @@ const testSNI = "www.example.com"
 // than the unusually small one a compact ECDSA cert would produce.
 func startBorrowedSite(t *testing.T) string {
 	t.Helper()
+	return startBorrowedSiteWith(t, false)
+}
+
+// startBorrowedSiteWithPostHandshakeRecords is the same site, but one that
+// sends the client something once the handshake finishes and before any
+// request arrives — the window session tickets land in. The measurement of that
+// window is only testable against a site that puts something in it.
+func startBorrowedSiteWithPostHandshakeRecords(t *testing.T) string {
+	t.Helper()
+	return startBorrowedSiteWith(t, true)
+}
+
+func startBorrowedSiteWith(t *testing.T, postHandshake bool) string {
+	t.Helper()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -63,8 +77,17 @@ func startBorrowedSite(t *testing.T) string {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				buf := make([]byte, 1024)
 				c.SetDeadline(time.Now().Add(5 * time.Second))
+				if postHandshake {
+					if tc, ok := c.(*tls.Conn); ok {
+						if err := tc.Handshake(); err != nil {
+							return
+						}
+					}
+					c.Write(make([]byte, 180))
+					c.Write(make([]byte, 180))
+				}
+				buf := make([]byte, 1024)
 				if _, err := c.Read(buf); err != nil {
 					return
 				}
@@ -81,6 +104,14 @@ func startBorrowedSite(t *testing.T) string {
 // server sends a certificate flight is separable on record sizes alone.
 func startRelay(t *testing.T, fallbackAddr string) (addr string, clientCfg transport.Config) {
 	t.Helper()
+	return startRelayShaped(t, fallbackAddr, nil)
+}
+
+// startRelayShaped is startRelay with a hook to damage the measured profile
+// before the relay serves from it. It exists for the canary tests: a harness
+// that cannot be shown to fail is not evidence that anything passed.
+func startRelayShaped(t *testing.T, fallbackAddr string, damage func(*transport.FlightProfile)) (addr string, clientCfg transport.Config) {
+	t.Helper()
 	priv, pub, err := transport.GenerateServerIdentity()
 	if err != nil {
 		t.Fatalf("relay identity: %v", err)
@@ -96,6 +127,12 @@ func startRelay(t *testing.T, fallbackAddr string) (addr string, clientCfg trans
 	}
 	if err := flight.Validate(); err != nil {
 		t.Fatalf("measured profile is unusable: %v", err)
+	}
+	if damage != nil {
+		damage(flight)
+		if err := flight.Validate(); err != nil {
+			t.Fatalf("damaged profile no longer passes Validate, so the relay would refuse to serve and the canary would test nothing: %v", err)
+		}
 	}
 	t.Logf("measured %s", flight)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
