@@ -328,6 +328,14 @@ func Serve(ctx context.Context, ln net.Listener, cfg Config, handle Handler) err
 	}
 
 	replays := newReplayCache()
+
+	// Keep a few connections to the borrowed site dialed in the background so the
+	// splice does not pay a TCP connect on the path a censor times (ROADMAP H3).
+	// The pool is best-effort: a splice that cannot get a warm connection dials
+	// fresh, which is the behaviour before this existed.
+	pool := newWarmPool(cfg.FallbackAddr, warmPoolSize, warmConnTTL)
+	go pool.run(ctx)
+
 	for {
 		raw, err := ln.Accept()
 		if err != nil {
@@ -336,7 +344,7 @@ func Serve(ctx context.Context, ln net.Listener, cfg Config, handle Handler) err
 			}
 			return err
 		}
-		go serveConn(ctx, raw, cfg, replays, handle)
+		go serveConn(ctx, raw, cfg, replays, pool, handle)
 	}
 }
 
@@ -357,7 +365,7 @@ const sniffTimeout = 5 * time.Second
 // the connection, and the goroutine behind it, indefinitely.
 const spliceDrainGrace = 5 * time.Second
 
-func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCache, handle Handler) {
+func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCache, pool *warmPool, handle Handler) {
 	br := bufio.NewReaderSize(raw, maxRecordLen+recordHeaderLen)
 
 	raw.SetReadDeadline(time.Now().Add(sniffTimeout))
@@ -403,7 +411,7 @@ func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCac
 
 	// Not a Warren client (or a censor's probe) — splice to the real site
 	// so whatever they see is indistinguishable from a normal visit.
-	spliceToFallback(ctx, raw, br, cfg.FallbackAddr)
+	spliceToFallback(ctx, raw, br, cfg.FallbackAddr, pool)
 }
 
 // completeHandshake plays the relay's half of a session that has to look like a
@@ -542,7 +550,7 @@ func peekClientHello(r *bufio.Reader) (*parsedClientHello, int, error) {
 	}, recordLen, nil
 }
 
-func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallbackAddr string) {
+func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallbackAddr string, pool *warmPool) {
 	// How the connection *ends* is observable too. A real HTTPS server given
 	// plaintext HTTP typically aborts with an RST; if the relay answers the same
 	// request by relaying the site's bytes and then closing cleanly with a FIN,
@@ -566,10 +574,18 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 		raw.Close()
 	}()
 
-	d := net.Dialer{Timeout: 5 * time.Second}
-	upstream, err := d.DialContext(ctx, "tcp", fallbackAddr)
-	if err != nil {
-		return
+	// Prefer a connection the pool already dialed, so the censor's ClientHello is
+	// forwarded without a TCP connect in front of it — the round trip that
+	// otherwise separates this path from the tagged one (ROADMAP H3). A pool that
+	// is empty or whose connections are stale yields nothing and we dial fresh.
+	upstream := pool.get()
+	if upstream == nil {
+		d := net.Dialer{Timeout: 5 * time.Second}
+		var err error
+		upstream, err = d.DialContext(ctx, "tcp", fallbackAddr)
+		if err != nil {
+			return
+		}
 	}
 	defer upstream.Close()
 

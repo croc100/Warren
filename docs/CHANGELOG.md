@@ -4,6 +4,53 @@ Newest first. This file records *why* things changed, since that is the part a d
 does not keep. Structural decisions live in [`DESIGN.md`](../DESIGN.md) §14 and in
 [`docs/adr/`](adr/).
 
+## 2026-10-03 — L1 hardening: warm upstream connections close the answer-path residual
+
+The 2026-10-01 pass equalised the *answer* time of the relay's two paths — a
+tagged client answered from local state, everyone else spliced — but left a
+residual it measured and reported rather than closed (ROADMAP H3): the splice
+pays a fresh TCP connect to the borrowed site that the tagged path never spends,
+so connections to one relay IP still split into two latency modes, a round trip
+apart. That split is the cheapest distinguisher there is — a clock and enough
+samples, no key and no decryption.
+
+The two candidate fixes were not equal. Making the tagged path *wait* the extra
+round trip would have closed the split between the relay's own two paths only by
+opening one against the borrowed site: a tagged client would then answer a round
+trip slower than the real site does, turning `cmd/probe`'s site-comparison
+latency finding into a standing false positive on any remote site. So the fix is
+the other one — stop paying the connect on the hot path.
+
+`warmpool.go` keeps a small bounded pool (four) of connections to the borrowed
+site dialed in the background, and the splice takes one instead of dialing when a
+probe arrives. All three latencies — tagged, spliced, and a direct visit to the
+site — then converge on the site's own answer time.
+
+It is best-effort on purpose. An idle TCP connection to the site can be closed
+under the relay at any time (keep-alive timeouts, load shedding, the site
+starting to reject this relay — DESIGN §15), so every connection is health-checked
+at hand-out: a borrowed TLS site never speaks before the ClientHello, so a
+healthy idle connection has nothing to read and the probe read times out, while
+an EOF, a reset, or unexpected data retires it. A pool that is empty or stale
+falls straight back to dialing fresh, which is exactly the behaviour before this
+existed — a `TestSpliceDialsFreshWhenPoolIsEmpty` pins that the fallback still
+reaches the site.
+
+The load-bearing test is a canary for the whole thing: it points the splice's
+fresh-dial fallback at an address that refuses connections, so the only way a
+byte reaches the site is through a pre-dialed connection. If the splice ever
+stops consulting the pool, the echo never returns and the test fails — which is
+what keeps the warm path from quietly becoming dead code beside a splice that
+dials fresh every time anyway.
+
+The cost is a footprint the borrowed site's operator can see: up to four idle
+connections held open continuously. That is now the natural place to account for
+connection limits and for what a relay owes the site it borrows (ROADMAP H7,
+H24), and the backlog says so.
+
+Verified: `go build`, `go vet`, `go test ./...`, `gofmt`. Not verified locally:
+`-race` (needs cgo and a C toolchain this machine lacks); CI covers it.
+
 ## 2026-10-03 — L1 hardening: echo the borrowed suite, correct the SNI claim
 
 Two distinguishers found while reading the code during the 2026-10-01 pass
