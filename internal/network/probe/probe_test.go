@@ -262,6 +262,45 @@ func TestProbeSuite_TLSHandshakeSeesBorrowedCertificate(t *testing.T) {
 	}
 }
 
+// TestUnexpectedSNIIsSplicedToTheBorrowedSite is H5: a relay fronts one site and
+// splices every unauthenticated connection to it regardless of the SNI, so a
+// probe that presents an SNI the relay does not front must still be answered by
+// the borrowed site — the same certificate a real single-site server returns for
+// an unexpected SNI. A relay that routed by SNI would hand back a certificate for
+// a different name, which the leaf digest would expose.
+func TestUnexpectedSNIIsSplicedToTheBorrowedSite(t *testing.T) {
+	site := startBorrowedSite(t)
+	relay, _ := startRelay(t, site)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// The probe must be in the suite — otherwise H5's guard runs nowhere.
+	var inSuite bool
+	for _, p := range Suite() {
+		if p.Name == "unexpected-sni" {
+			inSuite = true
+		}
+	}
+	if !inSuite {
+		t.Fatal("the unexpected-sni probe is not in the suite; H5's guard is not running")
+	}
+
+	const unexpected = "nonexistent.example"
+	viaRelay := runTLSHandshake(ctx, relay, unexpected)
+	direct := runTLSHandshake(ctx, site, unexpected)
+
+	// The comparison is only meaningful if both actually handshook and returned a
+	// certificate; "both failed identically" would pass vacuously.
+	if !viaRelay.HandshakeOK || viaRelay.CertSHA256 == "" {
+		t.Fatalf("relay did not complete a handshake and present a certificate under an unexpected SNI: %+v", viaRelay)
+	}
+	if viaRelay.CertSHA256 != direct.CertSHA256 {
+		t.Errorf("under an unexpected SNI the relay returned certificate %q, the borrowed site %q: a relay that routed by SNI would do exactly this",
+			viaRelay.CertSHA256, direct.CertSHA256)
+	}
+}
+
 // TestCompare_FlightMatchesRealSite is Stage A's verdict, measured rather than
 // asserted: a Warren session's record shape no longer separates from a real TLS
 // session to the same site.

@@ -41,14 +41,14 @@ func TestTagStopsVerifyingOnceItsWindowPasses(t *testing.T) {
 	minted := time.Now()
 	copy(sessionID, deriveTag(keys.authSS, clientRandom, keys.share, tagWindowIndex(minted)))
 
-	if _, err := serverAccept(priv, clientRandom, sessionID, keys.share, minted); err != nil {
+	if _, err := serverAccept(priv, clientRandom, sessionID, keys.share, minted, 0); err != nil {
 		t.Fatalf("a freshly minted tag was rejected: %v", err)
 	}
 
 	// Well past every window the relay will accept. A captured hello is now
 	// inert on its own terms, with no cache lookup involved.
 	late := minted.Add(tagAcceptanceSpan + 2*tagWindow)
-	if _, err := serverAccept(priv, clientRandom, sessionID, keys.share, late); err == nil {
+	if _, err := serverAccept(priv, clientRandom, sessionID, keys.share, late, 0); err == nil {
 		t.Fatalf("a tag minted %s earlier still verified; a captured hello stays replayable forever once the cache forgets it",
 			late.Sub(minted))
 	}
@@ -84,7 +84,7 @@ func TestTagToleratesClockSkewWithinTheSlack(t *testing.T) {
 		tagWindow - time.Minute,
 	} {
 		relayNow := base.Add(skew)
-		if _, err := serverAccept(priv, clientRandom, sessionID, keys.share, relayNow); err != nil {
+		if _, err := serverAccept(priv, clientRandom, sessionID, keys.share, relayNow, 0); err != nil {
 			t.Errorf("a client %s out of step with the relay was refused: %v", skew, err)
 		}
 	}

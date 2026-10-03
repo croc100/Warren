@@ -130,8 +130,6 @@ from it, not by effort. Items marked **found** came out of the hardening pass on
 | H1 | **Traffic shape after the handshake** (`bucket`/`cover`, DESIGN §6.4) | The largest measured gap. The machinery exists — every record carries a kind byte and filler is already discarded by the peer — so this is a policy layer over tested code, not a new wire format. Slice 2 |
 | H2 | **The gate stops measuring where the handshake ends** | `cmd/probe` compares handshake shape and now answer timing; it does not compare the data phase against the borrowed site's real responses. Slice 1's PASS is routinely misread as deployability because of this |
 | H3 | **One round trip still separates the relay's two answer paths** — *found* | The ServerHello wait equalises the site's answer time but not the TCP connect the splice additionally pays. Fix is warm upstream connections (better: keeps Warren fast) or measuring from dial (simpler: makes Warren slower). Measured and reported by `cmd/probe` today |
-| H4 | **The relay hardcodes its ServerHello cipher suite** — *found* | `tls13CipherSuite` is pinned to `TLS_AES_128_GCM_SHA256`, and the profile never records what the borrowed site actually negotiated. Against a site preferring AES-256 or ChaCha20, a tagged client and a spliced probe get *different* cipher suites from the same relay. It names nothing about how Warren really encrypts, so echoing the measured value is free |
-| H5 | **The splice ignores the ClientHello's SNI** — *found* | The code always dials `FallbackAddr`; the package comment and the README both say it splices to the site the SNI names. A probe presenting an unexpected SNI gets a certificate for the wrong name. Fix the behaviour or the claim, and add the probe case either way |
 | H6 | **No session rekey** | One ChaCha20-Poly1305 key for the whole connection, no record-count limit, no KeyUpdate equivalent. TLS 1.3 rekeys; a long-lived tunnel should too |
 
 ### Resource and failure behaviour
@@ -177,6 +175,16 @@ from it, not by effort. Items marked **found** came out of the hardening pass on
 | H23 | **No `SECURITY.md`** | `CONTRIBUTING` has a section, but without the top-level file GitHub shows no reporting path — on a project whose stated most-wanted contribution is adversarial |
 | H24 | **No relay operator guide** | How to choose a site to borrow, what that site's operator sees (a handshake every 30 minutes, plus a connection per probe), and what abuse handling is expected. §7.4 is logged as a requirement with nothing written against it |
 | H25 | **"~5,500 lines" is hardcoded in four documents** | A drift magnet. Say it once, or derive it |
+
+### Resolved
+
+Closed since the 2026-10-01 pass, kept here so the numbering stays stable and
+the history is legible.
+
+| # | Item | How it was closed |
+|---|------|-------------------|
+| H4 | **The relay hardcoded its ServerHello cipher suite** — *found* | ✅ `ProfileSite` now records the suite the borrowed site negotiates (`FlightProfile.CipherSuite`) and the relay echoes it rather than a pinned `TLS_AES_128_GCM_SHA256`, so a tagged client and a spliced probe see the same suite. `cmd/probe` compares the two ServerHellos' suites, guarded by a canary. It still names nothing about how Warren encrypts (ChaCha20-Poly1305 under the derived key); the echoed value only has to agree with the site |
+| H5 | **The splice ignored the ClientHello's SNI** — *found* | ✅ Claim corrected rather than behaviour changed: a relay fronts **one** site and splices every unauthenticated connection to `FallbackAddr` regardless of the SNI, exactly as a real single-site server answers an unexpected SNI with its own default certificate. Routing by SNI was rejected on purpose — it would make the relay an open proxy to arbitrary hosts (see H7). The package comment is fixed and a `unexpected-sni` probe asserts the relay still matches the borrowed site |
 
 ---
 

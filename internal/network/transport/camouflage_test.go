@@ -351,11 +351,11 @@ func TestEphemeralSecretsDifferPerConnection(t *testing.T) {
 	now := time.Now()
 	copy(sessionID, deriveTag(first.authSS, clientRandom, first.share, tagWindowIndex(now)))
 
-	acceptA, err := serverAccept(priv, clientRandom, sessionID, first.share, now)
+	acceptA, err := serverAccept(priv, clientRandom, sessionID, first.share, now, 0)
 	if err != nil {
 		t.Fatalf("serverAccept: %v", err)
 	}
-	acceptB, err := serverAccept(priv, clientRandom, sessionID, first.share, now)
+	acceptB, err := serverAccept(priv, clientRandom, sessionID, first.share, now, 0)
 	if err != nil {
 		t.Fatalf("serverAccept: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestEphemeralSecretsDifferPerConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate identity: %v", err)
 	}
-	if _, err := serverAccept(otherPriv, clientRandom, sessionID, first.share, now); err == nil {
+	if _, err := serverAccept(otherPriv, clientRandom, sessionID, first.share, now, 0); err == nil {
 		t.Fatal("a relay holding a different identity key validated the tag")
 	}
 }

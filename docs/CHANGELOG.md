@@ -4,6 +4,55 @@ Newest first. This file records *why* things changed, since that is the part a d
 does not keep. Structural decisions live in [`DESIGN.md`](../DESIGN.md) §14 and in
 [`docs/adr/`](adr/).
 
+## 2026-10-03 — L1 hardening: echo the borrowed suite, correct the SNI claim
+
+Two distinguishers found while reading the code during the 2026-10-01 pass
+(ROADMAP H4 and H5), closed together because both are about the relay's two
+answer paths — local for a tagged client, spliced for everyone else — agreeing
+on what they put in cleartext.
+
+### The relay echoes the cipher suite the site negotiates (H4)
+
+`buildServerHello` pinned the suite to `TLS_AES_128_GCM_SHA256`, and the profile
+never recorded what the borrowed site actually chose. The cipher suite sits in
+cleartext in the ServerHello, so against a site preferring AES-256 or ChaCha20 a
+tagged client got `0x1301` from local state while a spliced probe got the site's
+real choice — two suites from one address, separable with no decryption and no
+key, exactly the shape of split the 2026-10-01 pass closed on the time axis.
+
+`ProfileSite` now reads the negotiated suite off the wire
+(`FlightProfile.CipherSuite`) and the relay echoes it. The value names nothing
+about how Warren encrypts the session — that is still ChaCha20-Poly1305 under the
+derived key regardless — it only has to match what the site answers, so echoing
+the measured value costs nothing. An unmeasured profile falls back to the pinned
+suite, which every parroted Chrome hello offers.
+
+The gate now measures it: `Compare` parses both ServerHellos' suites and reports
+a mismatch, and a canary (`TestCanary_CipherSuiteMismatchIsDetected`) forces the
+relay onto a suite the site does not negotiate and requires the finding to fire —
+because a measurement with no canary is one that can quietly stop measuring.
+
+### The SNI claim is corrected to match the single-site splice (H5)
+
+The transport package comment said an unauthenticated connection is spliced "to
+the real site the ClientHello's SNI names". It is not: a relay fronts **one**
+site and splices every unauthenticated connection to `FallbackAddr`, whatever SNI
+the hello carried. For real traffic the two coincide — a genuine Warren client
+always presents the borrowed site's SNI — and for a probe presenting some other
+name the relay hands back the borrowed site anyway, which is precisely what a
+real single-site server does with an unexpected SNI (its default certificate).
+
+Routing by SNI was considered and rejected: it would turn the relay into an open
+proxy to arbitrary hosts, which is the amplification problem tracked as H7, and a
+security regression rather than a fix. So the behaviour is correct and the claim
+was wrong; the comment is fixed, and an `unexpected-sni` probe now asserts the
+relay still matches the borrowed site under a name neither endpoint fronts — a
+relay that *did* route by SNI would return a certificate for a different name and
+separate itself on the leaf digest alone.
+
+Verified: `go build`, `go vet`, `go test ./...`, `gofmt`. Not verified locally:
+`-race` (needs cgo and a C toolchain this machine lacks); CI covers it.
+
 ## 2026-10-01 — L1 hardening: answer timing, replay freshness, and canaries on the gate
 
 Three weaknesses closed and three defects found on the way, one of which had been

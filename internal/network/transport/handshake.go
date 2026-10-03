@@ -49,11 +49,15 @@ const (
 	hybridClientShareLen = mlkem.EncapsulationKeySize768 + x25519KeyLen // 1216
 	hybridServerShareLen = mlkem.CiphertextSize768 + x25519KeyLen       // 1120
 
-	// tls13CipherSuite is echoed in the ServerHello. Every Chrome profile
-	// offers TLS_AES_128_GCM_SHA256, so selecting it is always consistent
-	// with the ClientHello we just parroted. It names nothing about how
-	// Warren actually encrypts the session (that's ChaCha20-Poly1305 under
-	// the derived key); it only has to be a suite the client offered.
+	// tls13CipherSuite is the ServerHello fallback when the borrowed site's
+	// negotiated suite has not been measured (FlightProfile.CipherSuite == 0).
+	// Every Chrome profile offers TLS_AES_128_GCM_SHA256, so selecting it is
+	// always consistent with the ClientHello we just parroted. It names nothing
+	// about how Warren actually encrypts the session (that's ChaCha20-Poly1305
+	// under the derived key); it only has to be a suite the client offered. When
+	// the profile carries the site's real choice, that is echoed instead, so a
+	// site preferring AES-256 or ChaCha20 does not split the relay's two answer
+	// paths onto different suites.
 	tls13CipherSuite = 0x1301
 
 	extSupportedVersions = 0x002b
@@ -285,8 +289,11 @@ type acceptResult struct {
 }
 
 // serverAccept validates a client's tag and produces everything the relay needs
-// to answer.
-func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte, now time.Time) (*acceptResult, error) {
+// to answer. cipherSuite is the suite the borrowed site negotiated (from its
+// FlightProfile), echoed in the ServerHello so the relay's two answer paths —
+// local for a tagged client, spliced for everyone else — agree on it; zero
+// falls back to a suite every parroted ClientHello offers.
+func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte, now time.Time, cipherSuite uint16) (*acceptResult, error) {
 	if len(identityKey) != x25519KeyLen {
 		return nil, ErrIdentityMissing
 	}
@@ -341,7 +348,7 @@ func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte, now 
 		return nil, err
 	}
 	return &acceptResult{
-		serverHello:  buildServerHello(sessionID, serverRandom, serverShare),
+		serverHello:  buildServerHello(sessionID, serverRandom, serverShare, cipherSuite),
 		sessionKey:   key,
 		serverRandom: serverRandom,
 		serverShare:  serverShare,
@@ -354,8 +361,13 @@ var errTagMismatch = errors.New("transport: client hello tag mismatch")
 // key_share. Everything about its shape — legacy version 0x0303, the echoed
 // session_id, supported_versions announcing TLS 1.3, key_share carrying
 // ciphertext||x25519 for group X25519MLKEM768 — is what a real TLS 1.3 server
-// answering our parroted ClientHello would send.
-func buildServerHello(sessionIDEcho, serverRandom, serverShare []byte) []byte {
+// answering our parroted ClientHello would send. cipherSuite is the suite the
+// borrowed site negotiated; zero falls back to TLS_AES_128_GCM_SHA256, which
+// every parroted Chrome profile offers.
+func buildServerHello(sessionIDEcho, serverRandom, serverShare []byte, cipherSuite uint16) []byte {
+	if cipherSuite == 0 {
+		cipherSuite = tls13CipherSuite
+	}
 	ext := make([]byte, 0, 16+len(serverShare))
 	ext = appendUint16(ext, extSupportedVersions)
 	ext = appendUint16(ext, 2)
@@ -372,7 +384,7 @@ func buildServerHello(sessionIDEcho, serverRandom, serverShare []byte) []byte {
 	body = append(body, serverRandom...)
 	body = append(body, byte(len(sessionIDEcho)))
 	body = append(body, sessionIDEcho...)
-	body = appendUint16(body, tls13CipherSuite)
+	body = appendUint16(body, cipherSuite)
 	body = append(body, 0x00) // legacy_compression_method
 	body = appendUint16(body, uint16(len(ext)))
 	body = append(body, ext...)
@@ -392,7 +404,7 @@ func buildServerHello(sessionIDEcho, serverRandom, serverShare []byte) []byte {
 // ServerHello handshake body, rejecting anything that isn't the group Warren
 // hides its handshake in.
 func parseServerHello(body []byte) (serverRandom, serverShare []byte, err error) {
-	serverRandom, group, share, err := parseServerHelloParts(body)
+	serverRandom, group, _, share, err := parseServerHelloParts(body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -406,33 +418,34 @@ func parseServerHello(body []byte) (serverRandom, serverShare []byte, err error)
 // borrowed site: there we need to know *which* group the site actually
 // negotiated, because a site that doesn't offer the hybrid group cannot
 // plausibly be the one answering a hybrid ClientHello.
-func parseServerHelloParts(body []byte) (serverRandom []byte, group uint16, share []byte, err error) {
+func parseServerHelloParts(body []byte) (serverRandom []byte, group, cipherSuite uint16, share []byte, err error) {
 	// server_hello(1) + length(3) + legacy_version(2) + random(32) + session_id_len(1)
 	if len(body) < 39 || body[0] != 0x02 {
-		return nil, 0, nil, ErrBadServerHello
+		return nil, 0, 0, nil, ErrBadServerHello
 	}
 	p := body[4:]
 	if len(p) < 35 {
-		return nil, 0, nil, ErrBadServerHello
+		return nil, 0, 0, nil, ErrBadServerHello
 	}
 	serverRandom = append([]byte(nil), p[2:34]...)
 	sidLen := int(p[34])
 	p = p[35:]
 	if len(p) < sidLen+2+1+2 {
-		return nil, 0, nil, ErrBadServerHello
+		return nil, 0, 0, nil, ErrBadServerHello
 	}
+	cipherSuite = uint16(p[sidLen])<<8 | uint16(p[sidLen+1])
 	p = p[sidLen+3:] // session_id + cipher_suite(2) + compression(1)
 
 	extLen := int(p[0])<<8 | int(p[1])
 	p = p[2:]
 	if len(p) < extLen {
-		return nil, 0, nil, ErrBadServerHello
+		return nil, 0, 0, nil, ErrBadServerHello
 	}
 	for ext := p[:extLen]; len(ext) >= 4; {
 		extType := uint16(ext[0])<<8 | uint16(ext[1])
 		bodyLen := int(ext[2])<<8 | int(ext[3])
 		if len(ext) < 4+bodyLen {
-			return nil, 0, nil, ErrBadServerHello
+			return nil, 0, 0, nil, ErrBadServerHello
 		}
 		payload := ext[4 : 4+bodyLen]
 		ext = ext[4+bodyLen:]
@@ -443,11 +456,11 @@ func parseServerHelloParts(body []byte) (serverRandom []byte, group uint16, shar
 		group = uint16(payload[0])<<8 | uint16(payload[1])
 		shareLen := int(payload[2])<<8 | int(payload[3])
 		if len(payload) < 4+shareLen {
-			return nil, 0, nil, ErrBadServerHello
+			return nil, 0, 0, nil, ErrBadServerHello
 		}
-		return serverRandom, group, append([]byte(nil), payload[4:4+shareLen]...), nil
+		return serverRandom, group, cipherSuite, append([]byte(nil), payload[4:4+shareLen]...), nil
 	}
-	return nil, 0, nil, ErrBadServerHello
+	return nil, 0, 0, nil, ErrBadServerHello
 }
 
 func appendUint16(b []byte, v uint16) []byte { return append(b, byte(v>>8), byte(v)) }

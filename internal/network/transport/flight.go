@@ -55,6 +55,18 @@ type FlightProfile struct {
 	Group          uint16
 	ServerHelloLen int
 
+	// CipherSuite is the TLS 1.3 cipher suite the borrowed site selected in its
+	// ServerHello. The relay echoes this value in its own ServerHello rather
+	// than a hardcoded one: the suite sits in cleartext, so a site that prefers
+	// AES-256 or ChaCha20 while the relay always answered TLS_AES_128_GCM_SHA256
+	// would hand a tagged client and a spliced probe different suites from the
+	// same address — a distinguisher on the ServerHello, with no decryption
+	// needed. It names nothing about how Warren actually encrypts the session
+	// (that is ChaCha20-Poly1305 under the derived key); it only has to agree
+	// with what the site answers. Zero means unmeasured, and buildServerHello
+	// falls back to a suite every parroted ClientHello offers.
+	CipherSuite uint16
+
 	// ServerHelloDelay is how long the borrowed site took to answer a
 	// ClientHello, measured from the relay's own vantage point: one network
 	// round trip to the site plus whatever the site spends choosing parameters
@@ -283,8 +295,9 @@ func (t *profilingTap) profile(addr, sni string) (*FlightProfile, error) {
 		}
 	}
 
-	if _, group, _, err := parseServerHelloParts(serverHelloBody(t.serverHello)); err == nil {
+	if _, group, cipherSuite, _, err := parseServerHelloParts(serverHelloBody(t.serverHello)); err == nil {
 		p.Group = group
+		p.CipherSuite = cipherSuite
 	}
 	if len(p.ServerFlight) > maxFlightRecords {
 		p.ServerFlight = p.ServerFlight[:maxFlightRecords]
@@ -364,8 +377,8 @@ func (p *FlightProfile) TotalServerFlight() int {
 
 func (p *FlightProfile) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s (%s): group 0x%04x, ServerHello %d B after %s, flight %d B in %d records",
-		p.Site, p.SNI, p.Group, p.ServerHelloLen, p.ServerHelloDelay.Round(time.Millisecond),
+	fmt.Fprintf(&b, "%s (%s): group 0x%04x, cipher 0x%04x, ServerHello %d B after %s, flight %d B in %d records",
+		p.Site, p.SNI, p.Group, p.CipherSuite, p.ServerHelloLen, p.ServerHelloDelay.Round(time.Millisecond),
 		p.TotalServerFlight(), len(p.ServerFlight))
 	if len(p.PostClientFlight) > 0 {
 		post := 0

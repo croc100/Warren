@@ -83,6 +83,35 @@ func TestCanary_AnswerLatencySplitIsDetected(t *testing.T) {
 	}
 }
 
+// TestCanary_CipherSuiteMismatchIsDetected guards the cipher-suite measurement
+// (H4). The borrowed site negotiates one TLS 1.3 suite; a relay that answers a
+// tagged client with a different one splits its two answer paths onto suites a
+// censor can read in cleartext from the ServerHello. The measurement is new, so
+// it gets a canary: force the relay to echo a suite the loopback site does not
+// negotiate and require the comparison to say so.
+func TestCanary_CipherSuiteMismatchIsDetected(t *testing.T) {
+	site := startBorrowedSite(t)
+
+	relay, clientCfg := startRelayShaped(t, site, func(p *transport.FlightProfile) {
+		// The Go test site negotiates AES-128 (0x1301) on loopback hardware;
+		// force the relay to answer AES-256 so the two disagree. This does not
+		// touch Warren's own encryption, which is ChaCha20-Poly1305 under the
+		// derived key regardless of the suite named here.
+		p.CipherSuite = 0x1302
+	})
+
+	report := captureAndCompare(t, relay, clientCfg, site)
+
+	f := findingByName(t, report, "ServerHello cipher suite")
+	if f.Warren == "unparsed" || f.Real == "unparsed" {
+		t.Fatalf("a ServerHello did not parse, so this canary measured nothing: warren %s, real %s", f.Warren, f.Real)
+	}
+	if !f.Distinguisher {
+		t.Errorf("a relay answering 0x1302 where the site negotiates %s was reported as indistinguishable: warren %s, real %s",
+			f.Real, f.Warren, f.Real)
+	}
+}
+
 // TestCanary_MissingSessionTicketsAreDetected guards the post-handshake
 // measurement, which is the one a relay would fail a few records later than the
 // certificate flight if it stopped replaying what the site sends after the

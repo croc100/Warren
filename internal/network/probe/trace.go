@@ -75,11 +75,22 @@ type Trace struct {
 	// ClientHello can be replayed back at the relay (ReplayProbe) — which is
 	// exactly the move a censor makes with one recording.
 	ClientBytes []byte
+
+	// ServerBytes is the head of the server->client stream, kept so the
+	// ServerHello's cleartext fields — the negotiated cipher suite in
+	// particular — can be read back off the wire. A censor needs no key to see
+	// them, so the harness compares them the same way.
+	ServerBytes []byte
 }
 
 // maxCapturedClientBytes bounds ClientBytes; a ClientHello record is ~1.5 KB
-// and nothing beyond the first record is replayable anyway.
-const maxCapturedClientBytes = 16 << 10
+// and nothing beyond the first record is replayable anyway. maxCapturedServerBytes
+// matches it: a hybrid ServerHello record is ~1.2 KB and only the first record
+// is parsed.
+const (
+	maxCapturedClientBytes = 16 << 10
+	maxCapturedServerBytes = 16 << 10
+)
 
 // FirstClientRecord returns the first complete TLS record the client sent, or
 // nil if the capture did not contain one.
@@ -92,6 +103,38 @@ func (t Trace) FirstClientRecord() []byte {
 		return nil
 	}
 	return t.ClientBytes[:end]
+}
+
+// ServerHelloCipherSuite reads the negotiated cipher suite out of the first
+// server handshake record. It parses only the fixed prefix up to the suite —
+// legacy_version, random, session_id, cipher_suite — which is all cleartext in
+// a TLS 1.3 ServerHello. ok is false if the capture held no parseable
+// ServerHello.
+func (t Trace) ServerHelloCipherSuite() (suite uint16, ok bool) {
+	b := t.ServerBytes
+	if len(b) < 5 || b[0] != TypeHandshake {
+		return 0, false
+	}
+	recLen := int(b[3])<<8 | int(b[4])
+	rec := b[5:]
+	if recLen < len(rec) {
+		rec = rec[:recLen]
+	}
+	// handshake: msg_type(1)=server_hello + length(3) + body
+	if len(rec) < 4 || rec[0] != 0x02 {
+		return 0, false
+	}
+	body := rec[4:]
+	// legacy_version(2) + random(32) + session_id_len(1)
+	if len(body) < 35 {
+		return 0, false
+	}
+	sidLen := int(body[34])
+	p := body[35:]
+	if len(p) < sidLen+2 {
+		return 0, false
+	}
+	return uint16(p[sidLen])<<8 | uint16(p[sidLen+1]), true
 }
 
 func (t Trace) String() string {
@@ -124,6 +167,12 @@ func (s *scanner) Write(p []byte) (int, error) {
 		s.mu.Lock()
 		if room := maxCapturedClientBytes - len(s.out.ClientBytes); room > 0 {
 			s.out.ClientBytes = append(s.out.ClientBytes, p[:min(room, len(p))]...)
+		}
+		s.mu.Unlock()
+	} else {
+		s.mu.Lock()
+		if room := maxCapturedServerBytes - len(s.out.ServerBytes); room > 0 {
+			s.out.ServerBytes = append(s.out.ServerBytes, p[:min(room, len(p))]...)
 		}
 		s.mu.Unlock()
 	}
@@ -205,6 +254,7 @@ func Capture(ctx context.Context, label, target string, drive func(ctx context.C
 	defer mu.Unlock()
 	trace.Records = append([]Record(nil), trace.Records...)
 	trace.ClientBytes = append([]byte(nil), trace.ClientBytes...)
+	trace.ServerBytes = append([]byte(nil), trace.ServerBytes...)
 	sort.SliceStable(trace.Records, func(i, j int) bool { return trace.Records[i].At < trace.Records[j].At })
 	return trace, driveErr
 }
@@ -374,6 +424,23 @@ func Compare(warren, real Trace) Report {
 		Distinguisher: absDiff(wSH, rSH) > serverHelloSizeTolerance,
 	})
 
+	// The negotiated cipher suite, in cleartext in the ServerHello. The relay
+	// answers a tagged client from local state and everyone else by splicing to
+	// the borrowed site; if the local answer hardcodes a suite the site does not
+	// negotiate, the two paths to one address differ on a field a censor reads
+	// without a key. Only flagged when both ServerHellos parse, so a capture
+	// that missed one is not mistaken for a mismatch (that failure is the
+	// capture canary's job, not this measurement's).
+	wCS, wCSOK := warren.ServerHelloCipherSuite()
+	rCS, rCSOK := real.ServerHelloCipherSuite()
+	r.Findings = append(r.Findings, Finding{
+		Name:          "ServerHello cipher suite",
+		Warren:        cipherSuiteName(wCS, wCSOK),
+		Real:          cipherSuiteName(rCS, rCSOK),
+		Distinguisher: wCSOK && rCSOK && wCS != rCS,
+		Note:          "the relay must echo the suite the borrowed site negotiates, not a hardcoded one",
+	})
+
 	// How long the peer took to answer, which is a shape measurement on the
 	// time axis and the cheapest one a passive observer has: it needs no
 	// decryption, no key, and no probe of its own, just a clock.
@@ -540,6 +607,25 @@ func shortType(t byte) string {
 		return "alert"
 	default:
 		return "?"
+	}
+}
+
+// cipherSuiteName renders a TLS 1.3 cipher suite for a report. The three TLS
+// 1.3 suites get their names; anything else is shown as its hex code, which is
+// enough to see a mismatch.
+func cipherSuiteName(suite uint16, ok bool) string {
+	if !ok {
+		return "unparsed"
+	}
+	switch suite {
+	case 0x1301:
+		return "AES_128_GCM_SHA256"
+	case 0x1302:
+		return "AES_256_GCM_SHA384"
+	case 0x1303:
+		return "CHACHA20_POLY1305_SHA256"
+	default:
+		return fmt.Sprintf("0x%04x", suite)
 	}
 }
 

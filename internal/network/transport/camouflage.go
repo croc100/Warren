@@ -20,9 +20,15 @@
 //     identity exchange (see handshake.go). Application data then flows in
 //     records shaped like TLS application_data.
 //   - tag invalid, absent, or replayed -> the connection is spliced
-//     byte-for-byte to the real site the ClientHello's SNI names. A censor's
-//     active probe (or any passive DPI classifier) sees a completely genuine
-//     handshake with the real site's real certificate, because it *is* one.
+//     byte-for-byte to the one site this relay borrows (Config.FallbackAddr),
+//     not to whatever the ClientHello's SNI names. A relay fronts a single
+//     site, and a genuine Warren client always carries that site's SNI
+//     (Config.FallbackSNI) in its hello, so for real traffic the two are the
+//     same; a probe presenting some other SNI is still handed the borrowed
+//     site, exactly as a real single-site server answers an unexpected SNI
+//     with its own default certificate. A censor's active probe (or any
+//     passive DPI classifier) sees a completely genuine handshake with that
+//     site's real certificate, because it *is* one.
 //
 // Known gap vs. full REALITY (xtls/xray-core's `reality` package): a genuine
 // Warren session's second flight is shaped like TLS 1.3 but is not a real TLS
@@ -367,10 +373,19 @@ func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCac
 	// the key exchange below has to fall inside that budget rather than extend it.
 	helloAt := time.Now()
 	if err == nil {
-		accepted, acceptErr := serverAccept(
-			cfg.ServerPrivateKey, hello.random, hello.sessionID, hello.share, helloAt)
-
+		// Fetch the flight before validating the tag: its measured cipher suite
+		// goes into the ServerHello serverAccept builds, so the relay echoes the
+		// suite the borrowed site negotiated rather than a hardcoded one. A nil
+		// or unmeasured profile leaves it zero, which buildServerHello falls back
+		// from; flight.Validate below is what refuses to serve on a nil profile.
 		flight := cfg.flight()
+		var cipherSuite uint16
+		if flight != nil {
+			cipherSuite = flight.CipherSuite
+		}
+		accepted, acceptErr := serverAccept(
+			cfg.ServerPrivateKey, hello.random, hello.sessionID, hello.share, helloAt, cipherSuite)
+
 		if acceptErr == nil && flight.Validate() == nil && replays.admit(hello.random, helloAt) {
 			raw.SetReadDeadline(time.Now().Add(sniffTimeout + maxServerHelloDelay))
 			conn, err := completeHandshake(raw, br, recordLen, helloAt, accepted, flight, hello.random, hello.share)

@@ -60,6 +60,7 @@ func Suite() []Probe {
 	return []Probe{
 		tlsHandshakeProbe(),
 		repeatHandshakeProbe(),
+		unexpectedSNIProbe(),
 		plaintextHTTPProbe(),
 		randomJunkProbe(),
 		truncatedHelloProbe(),
@@ -145,6 +146,28 @@ func repeatHandshakeProbe() Probe {
 		},
 		Signature: func(o Observation) string {
 			return fmt.Sprintf("ok=%t cert=%s %s", o.HandshakeOK, o.CertSHA256, o.ErrClass)
+		},
+	}
+}
+
+// unexpectedSNIProbe connects with an SNI the relay does not front (H5). A
+// Warren relay borrows one site and splices every unauthenticated connection to
+// it regardless of the SNI presented — it does not route by SNI — so it must
+// answer an unexpected SNI exactly as the borrowed site does: with that site's
+// own default certificate. A relay that instead dialed the SNI-named host would
+// return a certificate for a different name and separate itself from the site on
+// the leaf digest alone. The SNI argument from the suite is deliberately ignored
+// in favour of a fixed name neither endpoint is configured for.
+func unexpectedSNIProbe() Probe {
+	const unexpected = "nonexistent.example"
+	return Probe{
+		Name: "unexpected-sni",
+		Desc: "handshake with an SNI the relay does not front; it must still answer like the borrowed site",
+		Run: func(ctx context.Context, addr, _ string) Observation {
+			return runTLSHandshake(ctx, addr, unexpected)
+		},
+		Signature: func(o Observation) string {
+			return fmt.Sprintf("ok=%t cert=%s err=%s", o.HandshakeOK, o.CertSHA256, o.ErrClass)
 		},
 	}
 }
