@@ -42,7 +42,6 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -176,7 +175,7 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 	}
 
 	sessionID := make([]byte, sessionIDLen)
-	copy(sessionID, deriveTag(keys.authSS, clientRandom, keys.share))
+	copy(sessionID, deriveTag(keys.authSS, clientRandom, keys.share, tagWindowIndex(time.Now())))
 	if _, err := io.ReadFull(randReader, sessionID[tagLen:]); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("transport: fill session id padding: %w", err)
@@ -263,7 +262,13 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 	confirm, err := conn.readServerFlight(serverMAC)
 	if err != nil {
 		raw.Close()
-		return nil, err
+		// This is where being spliced surfaces, and it surfaces as garbage: a
+		// relay that did not recognise the tag hands the connection to the site
+		// it borrows, so everything after the ServerHello is that site's real
+		// TLS session and none of it opens under our key. The raw error is an
+		// AEAD failure, which says nothing useful to whoever is trying to
+		// connect, so the likely causes get named here instead.
+		return nil, fmt.Errorf("%w: %v", ErrRelayRejected, err)
 	}
 
 	// A real TLS 1.3 client in middlebox-compatibility mode (which is what
@@ -339,6 +344,13 @@ func Serve(ctx context.Context, ln net.Listener, cfg Config, handle Handler) err
 // therefore arrives across several TCP segments rather than in one.
 const sniffTimeout = 5 * time.Second
 
+// spliceDrainGrace is how long the relay keeps relaying the borrowed site's
+// answer after the client has stopped sending. It exists so a response is never
+// cut short — a truncated answer is a difference from the site, and the site
+// does not truncate — and it is bounded so a site that goes quiet cannot hold
+// the connection, and the goroutine behind it, indefinitely.
+const spliceDrainGrace = 5 * time.Second
+
 func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCache, handle Handler) {
 	br := bufio.NewReaderSize(raw, maxRecordLen+recordHeaderLen)
 
@@ -350,14 +362,18 @@ func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCac
 	// signal (a real HTTPS server doesn't instantly RST on odd input), so we
 	// deliberately don't special-case parse errors from tag mismatches.
 	hello, recordLen, err := peekClientHello(br)
+	// Timestamped here rather than inside completeHandshake: the answer latency
+	// the relay has to reproduce is measured from the arrival of the hello, so
+	// the key exchange below has to fall inside that budget rather than extend it.
+	helloAt := time.Now()
 	if err == nil {
 		accepted, acceptErr := serverAccept(
-			cfg.ServerPrivateKey, hello.random, hello.sessionID, hello.share)
+			cfg.ServerPrivateKey, hello.random, hello.sessionID, hello.share, helloAt)
 
 		flight := cfg.flight()
-		if acceptErr == nil && flight.Validate() == nil && replays.admit(hello.random) {
-			raw.SetReadDeadline(time.Now().Add(sniffTimeout))
-			conn, err := completeHandshake(raw, br, recordLen, accepted, flight, hello.random, hello.share)
+		if acceptErr == nil && flight.Validate() == nil && replays.admit(hello.random, helloAt) {
+			raw.SetReadDeadline(time.Now().Add(sniffTimeout + maxServerHelloDelay))
+			conn, err := completeHandshake(raw, br, recordLen, helloAt, accepted, flight, hello.random, hello.share)
 			raw.SetReadDeadline(time.Time{})
 			if err != nil {
 				raw.Close()
@@ -383,6 +399,7 @@ func completeHandshake(
 	raw net.Conn,
 	br *bufio.Reader,
 	helloRecordLen int,
+	helloAt time.Time,
 	accepted *acceptResult,
 	flight *FlightProfile,
 	clientRandom, clientShare []byte,
@@ -393,6 +410,18 @@ func completeHandshake(
 	if _, err := br.Discard(helloRecordLen); err != nil {
 		return nil, err
 	}
+
+	// Answer no faster than the borrowed site does. The relay's other path —
+	// splicing an unauthenticated connection — pays a TCP dial to that site plus
+	// the site's own answer time, so without this wait one relay IP answers some
+	// connections in microseconds and the rest tens of milliseconds later. That
+	// split is visible to a passive observer with a clock and nothing else.
+	//
+	// The wait is measured from when the ClientHello landed, not from here, so
+	// the key exchange we just did comes out of the same budget rather than
+	// being added to it.
+	waitUntilAnswerTime(helloAt, flight.ServerHelloDelay)
+
 	if _, err := raw.Write(accepted.serverHello); err != nil {
 		return nil, err
 	}
@@ -425,6 +454,22 @@ func completeHandshake(
 		return nil, err
 	}
 	return conn, nil
+}
+
+// waitUntilAnswerTime sleeps so that `delay` has elapsed since `since`,
+// accounting for work already done. It is capped rather than trusted: a profile
+// carrying an implausible delay would otherwise let a slow or hostile borrowed
+// site hold every Warren handshake open for as long as it likes.
+func waitUntilAnswerTime(since time.Time, delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	if delay > maxServerHelloDelay {
+		delay = maxServerHelloDelay
+	}
+	if remaining := delay - time.Since(since); remaining > 0 {
+		time.Sleep(remaining)
+	}
 }
 
 // parsedClientHello is the handful of ClientHello fields the relay needs, held
@@ -491,6 +536,11 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 	//
 	// The probe harness (internal/network/probe) found this by comparing a relay
 	// against an OpenSSL-backed site; a Go-backed site closes cleanly and hid it.
+	//
+	// Whether a given error *is* a reset is platform-specific (see isConnReset):
+	// on Windows the portable-looking syscall.ECONNRESET never matches a real
+	// one, which left this mirroring dead on that platform for as long as CI
+	// only ran Linux.
 	var upstreamReset atomic.Bool
 	defer func() {
 		if upstreamReset.Load() {
@@ -508,24 +558,73 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 	}
 	defer upstream.Close()
 
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(upstream, br); done <- struct{}{} }()
+	// Client -> site. A reset here shows up as a *write* failure, so the writer
+	// is wrapped rather than the error being inspected afterwards: io.Copy
+	// returns one error and does not say which side produced it, and a reset
+	// from the client is not something to mirror back to that same client.
+	// Nothing is lost by wrapping — br is a bufio.Reader, so this direction has
+	// no kernel fast path to give up.
+	toSite := make(chan struct{})
 	go func() {
+		defer close(toSite)
+		io.Copy(&resetWatchingWriter{w: upstream, hit: &upstreamReset}, br)
+	}()
+
+	// Site -> client. Left unwrapped so io.Copy keeps its TCPConn-to-TCPConn
+	// fast path (splice(2) on Linux), which this direction carries the bulk of.
+	// The error is therefore ambiguous between a read failure from the site and
+	// a write failure to the client, and that is acceptable: if the client is
+	// the one that reset, the connection is already gone and marking it for a
+	// reset teardown changes nothing observable.
+	fromSite := make(chan struct{})
+	go func() {
+		defer close(fromSite)
 		_, err := io.Copy(raw, upstream)
-		if errors.Is(err, syscall.ECONNRESET) {
+		if isConnReset(err) {
 			upstreamReset.Store(true)
 		}
-		done <- struct{}{}
 	}()
-	<-done
 
-	// One direction finishing doesn't tell us how the other ended. Wait briefly
-	// for it so a reset arriving from upstream is still mirrored, but don't block
-	// on a peer that has simply stopped reading.
+	// The two directions are not interchangeable, which is why this waits on
+	// one of them by name rather than on whichever finishes first.
+	//
+	// The site's answer is the whole point of the splice: a probe judges the
+	// relay on what comes back, so relaying part of a response and then closing
+	// is itself a difference from the site, which always finishes what it
+	// started. Waiting on "either direction, then a fixed 200 ms" truncated
+	// exactly that — when the site closed its end straight after answering, the
+	// client-to-site copy could return first and start a grace period the
+	// response then had to beat. It usually did, and under load it sometimes
+	// did not, which showed up as the relay answering a probe with nothing
+	// where the site answered with an alert.
 	select {
-	case <-done:
-	case <-time.After(200 * time.Millisecond):
+	case <-fromSite:
+		// The site has finished; anything still travelling the other way has
+		// nowhere to go.
+	case <-toSite:
+		// The client stopped sending, which says nothing about whether the
+		// site has finished replying. Give it room to, bounded so a site that
+		// simply never answers cannot pin this connection open.
+		select {
+		case <-fromSite:
+		case <-time.After(spliceDrainGrace):
+		}
 	}
+}
+
+// resetWatchingWriter records whether writes to this particular side failed
+// with a peer reset, so the two halves of a splice can be told apart.
+type resetWatchingWriter struct {
+	w   io.Writer
+	hit *atomic.Bool
+}
+
+func (w *resetWatchingWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if err != nil && isConnReset(err) {
+		w.hit.Store(true)
+	}
+	return n, err
 }
 
 // bufferedConn lets us keep using a bufio.Reader (which may already hold

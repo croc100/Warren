@@ -260,6 +260,20 @@ const (
 	flightAbsoluteTolerance = 512 // bytes
 	flightRelativeTolerance = 0.5 // fraction of the real site's flight
 
+	// postHandshakeAbsoluteTolerance is deliberately far tighter than
+	// flightAbsoluteTolerance, because the two windows are not the same size.
+	// A certificate flight is kilobytes, so 512 B of slack there is a small
+	// fraction of it. The post-handshake window holds session tickets and is
+	// a few hundred bytes in total, so the same 512 B swallowed the whole
+	// measurement: a relay sending no tickets at all against a site sending
+	// two was reported as indistinguishable. A canary found that by removing
+	// the tickets and watching the gate stay green.
+	//
+	// It stays above zero because ticket contents carry timestamps and nonces
+	// and are not byte-identical between connections, and a harness that
+	// reports that variance is one people stop reading.
+	postHandshakeAbsoluteTolerance = 128
+
 	// helloSizeTolerance accommodates a browser profile's own variance. A
 	// current Chrome ClientHello is not a fixed size: the GREASE ECH payload
 	// randomizes it in 32-byte steps across roughly a 100-byte band (measured
@@ -267,6 +281,21 @@ const (
 	// would report that variance as a distinguisher, and a harness that cries
 	// wolf is a harness people stop reading.
 	helloSizeTolerance = 160
+
+	// answerLatencyAbsoluteTolerance and answerLatencyRelativeTolerance bound
+	// how far the relay's ClientHello-to-ServerHello gap may sit from the real
+	// site's. This is a shape measurement like the others, just on the time
+	// axis: the relay answers a genuine client out of local state while the
+	// same relay answers everyone else by splicing, which costs a round trip to
+	// the borrowed site. Unequalized, one relay IP shows two separate latency
+	// modes, which no real web server does.
+	//
+	// The absolute floor is what makes this usable on a loopback harness, where
+	// both sides answer in under a millisecond and scheduling noise is most of
+	// the signal; the relative term is what makes it mean something against a
+	// real remote site.
+	answerLatencyAbsoluteTolerance = 30 * time.Millisecond
+	answerLatencyRelativeTolerance = 0.5
 
 	// serverHelloSizeTolerance is tighter because a ServerHello's contents are
 	// determined by the negotiated group and the echoed session_id, with no
@@ -318,12 +347,22 @@ func Compare(warren, real Trace) Report {
 	// the certificate flight would have given it away.
 	wPost, wPostRecords := serverRecordsAfterClientFinished(warren)
 	rPost, rPostRecords := serverRecordsAfterClientFinished(real)
-	postTolerance := max(float64(flightAbsoluteTolerance), float64(rPost)*flightRelativeTolerance)
+	postTolerance := max(float64(postHandshakeAbsoluteTolerance), float64(rPost)*flightRelativeTolerance)
+	postDiffers := absDiff(wPost, rPost) > int(postTolerance)
+
+	// Silence where the site reliably speaks is categorical, not a matter of
+	// degree. Whatever the byte tolerance is set to, one peer sending nothing
+	// at all in a window the other always uses is the kind of difference a
+	// classifier keys on, so it is never inside tolerance.
+	if (wPostRecords == 0) != (rPostRecords == 0) {
+		postDiffers = true
+	}
+
 	r.Findings = append(r.Findings, Finding{
 		Name:          "post-handshake server records",
 		Warren:        fmt.Sprintf("%d B in %d records", wPost, wPostRecords),
 		Real:          fmt.Sprintf("%d B in %d records", rPost, rPostRecords),
-		Distinguisher: absDiff(wPost, rPost) > int(postTolerance),
+		Distinguisher: postDiffers,
 		Note:          "session tickets, in practice",
 	})
 
@@ -335,7 +374,82 @@ func Compare(warren, real Trace) Report {
 		Distinguisher: absDiff(wSH, rSH) > serverHelloSizeTolerance,
 	})
 
+	// How long the peer took to answer, which is a shape measurement on the
+	// time axis and the cheapest one a passive observer has: it needs no
+	// decryption, no key, and no probe of its own, just a clock.
+	wLatency, rLatency := answerLatency(warren), answerLatency(real)
+	latencyTolerance := max(answerLatencyAbsoluteTolerance, time.Duration(float64(rLatency)*answerLatencyRelativeTolerance))
+	r.Findings = append(r.Findings, Finding{
+		Name:          "ServerHello latency",
+		Warren:        wLatency.Round(time.Millisecond).String(),
+		Real:          rLatency.Round(time.Millisecond).String(),
+		Distinguisher: absDuration(wLatency, rLatency) > latencyTolerance,
+		Note:          "the relay answers from local state; splicing costs a round trip to the borrowed site",
+	})
+
 	return r
+}
+
+// CompareAnswerPaths measures a relay against itself rather than against the
+// site it borrows, which is the comparison a censor can make most cheaply.
+//
+// One relay IP answers on two paths. A client holding a valid tag is answered
+// out of local state plus whatever wait the borrowed site's measured latency
+// imposes. Everyone else — a probe, a stray HTTPS client, a Warren client with
+// the wrong key — is spliced, which costs the relay a fresh TCP connection to
+// the borrowed site on top of that site's own answer time.
+//
+// If those two costs differ, connections to that one address split into two
+// latency modes, and no real web server does that. It is the cheapest
+// distinguisher on the list: no decryption, no key, no active probing beyond
+// one ordinary handshake, just a clock and enough samples.
+//
+// Comparing the relay to the real site (Compare) cannot see this, because the
+// two sit on different network paths and are expected to differ. Only the
+// relay against itself isolates the part the relay controls.
+func CompareAnswerPaths(warrenViaRelay, splicedViaRelay Trace) Finding {
+	warren, spliced := answerLatency(warrenViaRelay), answerLatency(splicedViaRelay)
+	tolerance := max(answerLatencyAbsoluteTolerance, time.Duration(float64(spliced)*answerLatencyRelativeTolerance))
+	return Finding{
+		Name:          "answer latency, both paths",
+		Warren:        warren.Round(time.Millisecond).String(),
+		Real:          spliced.Round(time.Millisecond).String() + " (spliced)",
+		Distinguisher: absDuration(warren, spliced) > tolerance,
+		Note:          "same relay, tagged vs untagged; a split here is bimodality at one address",
+	}
+}
+
+// answerLatency is the gap between the client's first record and the server's,
+// i.e. ClientHello to ServerHello.
+func answerLatency(t Trace) time.Duration {
+	clientAt, ok := firstRecordAt(t, FromClient)
+	if !ok {
+		return 0
+	}
+	serverAt, ok := firstRecordAt(t, FromServer)
+	if !ok {
+		return 0
+	}
+	if serverAt < clientAt {
+		return 0
+	}
+	return serverAt - clientAt
+}
+
+func firstRecordAt(t Trace, dir Direction) (time.Duration, bool) {
+	for _, rec := range t.Records {
+		if rec.Dir == dir {
+			return rec.At, true
+		}
+	}
+	return 0, false
+}
+
+func absDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a - b
+	}
+	return b - a
 }
 
 // serverFlightAfterCCS totals the server records between the first

@@ -60,11 +60,22 @@ func main() {
 			log.Fatalf("probe: capture real session: %v", err)
 		}
 
+		// A third capture, against the relay but without a valid tag, so it is
+		// spliced. Comparing it with the Warren session isolates what the relay
+		// itself adds on each of its two answer paths — the one comparison a
+		// censor can make without leaving a single IP address.
+		splicedTrace, err := probe.Capture(ctx, "spliced", *relayAddr, driveRealTLS(*sni))
+		if err != nil {
+			log.Fatalf("probe: capture spliced session: %v", err)
+		}
+
 		report := probe.Compare(warrenTrace, realTrace)
+		report.Findings = append(report.Findings, probe.CompareAnswerPaths(warrenTrace, splicedTrace))
 		shape = &report
 
 		fmt.Println(warrenTrace)
 		fmt.Println(realTrace)
+		fmt.Println(splicedTrace)
 
 		if hello := warrenTrace.FirstClientRecord(); len(hello) > 0 {
 			extra = append(extra, probe.ReplayProbe(hello))

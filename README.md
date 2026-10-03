@@ -198,7 +198,10 @@ site, exactly like a probe), or `curl -v --http1.0 http://127.0.0.1:8443/`.
 ## Where it stands
 
 `cmd/probe` is the gate, and it exits non-zero on any distinguisher, so this table
-is measured rather than claimed:
+is measured rather than claimed. The gate is itself checked: canaries point the
+harness and the binary at relays that are deliberately wrong and fail if either
+reports PASS, because a harness that has quietly stopped measuring returns the
+same green as one that found nothing.
 
 | Adversary move | Warren's answer | State |
 |---|---|---|
@@ -207,6 +210,7 @@ is measured rather than claimed:
 | Certificate inspection by a prober | The prober gets the borrowed site's genuine chain | measured |
 | Handshake-shape classification | The relay replays its borrowed site's measured record shape, including session tickets | measured |
 | TCP teardown fingerprinting | An upstream reset is mirrored rather than turned into a clean close | measured |
+| Timing the answer to a ClientHello | The relay waits out the borrowed site's measured answer time, so it does not answer a tagged client in microseconds and everyone else in tens of milliseconds | measured, **partial** — the splice still pays one extra round trip, and the gate reports the residual |
 | Recording now to decrypt later | Hybrid X25519 + ML-KEM-768, forward secret per connection | implemented |
 | Hostile discovery channel | Signed, expiring descriptors covering each relay's identity key; resolvers fail closed without an anchor | implemented |
 | **A censor that runs a Warren client** | Nothing here stops it: it holds a valid tag and can see the flight is synthetic | **accepted gap** — it can enumerate bridges anyway, which is an L2 problem |
@@ -225,7 +229,9 @@ work and the relay pool are both unbuilt, and a real deployment needs both.
 - [`DESIGN.md`](DESIGN.md) — threat environment, layer specs, crypto inventory, and
   a table of decisions that were dropped and why
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — slices, each with a falsifiable gate
-  instead of a date
+  instead of a date, followed by a
+  [hardening backlog](docs/ROADMAP.md#hardening-backlog): the distinguishers,
+  resource limits and missing tests that are owed but do not gate a slice
 - [`docs/adr/0001-borrowed-tls-handshake.md`](docs/adr/0001-borrowed-tls-handshake.md)
   — how L1's mimicry gap is being closed, and why not by importing xray-core
 - [`docs/protocol/reality-transport.md`](docs/protocol/reality-transport.md) —

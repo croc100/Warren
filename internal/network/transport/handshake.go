@@ -7,6 +7,8 @@ import (
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -64,6 +66,22 @@ var (
 	ErrNoHybridShare   = errors.New("transport: ClientHello carries no X25519MLKEM768 key share")
 	ErrBadServerHello  = errors.New("transport: relay did not answer with a usable ServerHello")
 	ErrIdentityMissing = errors.New("transport: relay identity key missing from Config")
+
+	// ErrRelayRejected is what being treated as an ordinary visitor looks like
+	// from the client's side. The relay did not accept the tag, so it spliced
+	// the connection to the site it borrows and everything after the
+	// ServerHello belongs to that site's real TLS session.
+	//
+	// The relay cannot say why, and deliberately: an unrecognised tag has to be
+	// answered exactly like a censor's probe, or the difference between the two
+	// answers becomes the distinguisher. So the plausible causes are named here
+	// rather than reported from the other end — the relay key in the bridge
+	// descriptor is wrong or has been rotated, the address is not a Warren
+	// relay at all, or this device's clock is outside the tag's freshness
+	// window (see tagWindow).
+	ErrRelayRejected = errors.New(
+		"transport: the relay did not accept this connection and spliced it to the site it borrows; " +
+			"check the relay key in the bridge descriptor, and this device's clock")
 )
 
 // GenerateServerIdentity returns a new relay identity: a long-term X25519 key
@@ -114,16 +132,80 @@ func newClientKeys(relayPublicKey []byte) (*clientKeys, error) {
 	return &clientKeys{ecdhe: ecdheKey, mlkemDK: dk, share: share, authSS: authSS, relayPub: relayPub}, nil
 }
 
+// Freshness binding for the tag.
+//
+// The tag is a function of the hello, so a hello re-sent verbatim validates by
+// construction and the relay needs some other way to refuse it. A cache of
+// randoms already seen is the obvious answer and it is what the relay keeps,
+// but a cache is a memory budget, and any memory budget expires: a censor that
+// captures one genuine hello and simply waits out the cache gets a Warren
+// answer, which is the exact move the cache exists to stop.
+//
+// So the tag also covers a coarse clock, and the relay accepts only the
+// windows near its own. A hello then stops being replayable on its own terms,
+// bounded by arithmetic rather than by how much the relay can afford to
+// remember, and the cache's job shrinks to covering the window span.
+//
+// The cost is that a client whose clock is wrong past the slack cannot
+// connect, and cannot be told why by the relay: an out-of-window tag is
+// indistinguishable from a forged one, so it is spliced like any other
+// unauthenticated connection. That failure looks exactly like censorship from
+// the client's side, which is why Dial names the clock as a candidate cause
+// (see ErrRelayRejected).
+const (
+	// tagWindow is the granularity of the freshness binding.
+	tagWindow = 10 * time.Minute
+
+	// tagWindowSlack is how many windows either side of its own the relay will
+	// accept, and so how much clock skew a client may carry. One window either
+	// way gives at least tagWindow of tolerance in each direction.
+	tagWindowSlack = 1
+
+	// tagAcceptanceSpan is how long a given hello stays replayable at all: the
+	// whole range of windows a relay will accept. The replay cache has to
+	// remember at least this far back, and beyond it nothing needs remembering
+	// because the tag no longer verifies.
+	tagAcceptanceSpan = (2*tagWindowSlack + 1) * tagWindow
+)
+
+// tagWindowIndex is the coarse clock both sides bind into the tag.
+func tagWindowIndex(t time.Time) int64 {
+	return t.Unix() / int64(tagWindow/time.Second)
+}
+
 // deriveTag computes the authentication tag embedded in the ClientHello's
 // session_id. It binds the client's random *and* its key share, so a censor
 // who replays a captured hello with a substituted key share (hoping to have
-// the relay answer it) fails the check instead.
-func deriveTag(authSS, clientRandom, clientShare []byte) []byte {
+// the relay answer it) fails the check instead, and the coarse time window, so
+// a captured hello stops verifying once the window has passed.
+//
+// Nothing about this is visible on the wire: the window is an input to the
+// HMAC, not a field, so the hello is byte-for-byte the shape it was before.
+func deriveTag(authSS, clientRandom, clientShare []byte, window int64) []byte {
+	var w [8]byte
+	binary.BigEndian.PutUint64(w[:], uint64(window))
+
 	mac := hmac.New(sha256.New, authSS)
-	mac.Write([]byte("warren-tag-v1"))
+	mac.Write([]byte("warren-tag-v2"))
 	mac.Write(clientRandom)
 	mac.Write(clientShare)
+	mac.Write(w[:])
 	return mac.Sum(nil)[:tagLen]
+}
+
+// tagMatchesAnyWindow reports whether the tag verifies under the relay's own
+// window or either neighbour.
+//
+// Every window is always checked — no early exit — so the time this takes says
+// nothing about which window matched or whether any did.
+func tagMatchesAnyWindow(authSS, clientRandom, clientShare, tag []byte, now time.Time) bool {
+	center := tagWindowIndex(now)
+	match := 0
+	for d := int64(-tagWindowSlack); d <= tagWindowSlack; d++ {
+		want := deriveTag(authSS, clientRandom, clientShare, center+d)
+		match |= subtle.ConstantTimeCompare(want, tag)
+	}
+	return match == 1
 }
 
 // deriveSessionKey mixes the three shared secrets into the AEAD key. Every
@@ -204,7 +286,7 @@ type acceptResult struct {
 
 // serverAccept validates a client's tag and produces everything the relay needs
 // to answer.
-func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte) (*acceptResult, error) {
+func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte, now time.Time) (*acceptResult, error) {
 	if len(identityKey) != x25519KeyLen {
 		return nil, ErrIdentityMissing
 	}
@@ -223,7 +305,7 @@ func serverAccept(identityKey, clientRandom, sessionID, clientShare []byte) (*ac
 		return nil, fmt.Errorf("transport: derive auth secret: %w", err)
 	}
 
-	if !hmac.Equal(deriveTag(authSS, clientRandom, clientShare), sessionID[:tagLen]) {
+	if !tagMatchesAnyWindow(authSS, clientRandom, clientShare, sessionID[:tagLen], now) {
 		return nil, errTagMismatch
 	}
 
@@ -375,42 +457,122 @@ func appendUint16(b []byte, v uint16) []byte { return append(b, byte(v>>8), byte
 // without this a censor could capture one genuine hello and replay it to
 // confirm the relay answers differently than the real site does. A replay is
 // treated exactly like an unauthenticated connection: spliced to the real site.
+//
+// Entries are kept in generations that rotate, rather than in one map with a
+// per-entry timestamp, for two reasons.
+//
+// Expiry becomes free. Dropping a whole generation retires every random in it
+// at once, so there is no scan and no per-entry time.Time to store.
+//
+// More importantly, running out of room degrades instead of collapsing. The
+// previous version swept for expired entries when it hit its ceiling and, if
+// that freed nothing, emptied the map — so a relay busy enough to fill it
+// inside one TTL periodically forgot *everything* and had no replay protection
+// at all until it refilled. That is a cliff on a relay that is doing well, and
+// it is also silent. Here the ceiling retires the oldest generation only.
+//
+// What makes that safe is the freshness window in the tag: a random old enough
+// to fall out of the cache under pressure is close to being a random whose tag
+// no longer verifies anyway. The cache covers tagAcceptanceSpan and no more.
 type replayCache struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
-	ttl  time.Duration
-	max  int
+	mu sync.Mutex
+
+	// generations holds sets of randoms, oldest first. Only membership
+	// matters, so the values are empty.
+	generations []map[string]struct{}
+	rotatedAt   time.Time
+
+	span       time.Duration // how long one generation collects for
+	keep       int           // how many generations to retain
+	maxEntries int           // ceiling across all generations
+	entries    int
 }
+
+// replayCacheMaxEntries bounds the cache's memory. At roughly 80 bytes per
+// entry this is about 10 MB fully loaded, which a relay on domestic hardware
+// can afford; reaching it means sustaining a few hundred authenticated
+// handshakes a minute for the whole acceptance span, and the consequence is
+// that the oldest generation retires early rather than that anything fails.
+const replayCacheMaxEntries = 1 << 17
 
 func newReplayCache() *replayCache {
-	return &replayCache{seen: make(map[string]time.Time), ttl: 10 * time.Minute, max: 1 << 16}
+	// Four generations of one window each: retention lands between three and
+	// four windows, so it always covers tagAcceptanceSpan (three windows) no
+	// matter where in a generation a hello arrives.
+	return newReplayCacheWith(tagWindow, 4, replayCacheMaxEntries, time.Now())
 }
 
-// admit records the random and reports whether this is the first time we've
-// seen it.
-func (c *replayCache) admit(clientRandom []byte) bool {
+func newReplayCacheWith(span time.Duration, keep, maxEntries int, now time.Time) *replayCache {
+	return &replayCache{
+		generations: []map[string]struct{}{make(map[string]struct{})},
+		rotatedAt:   now,
+		span:        span,
+		keep:        keep,
+		maxEntries:  maxEntries,
+	}
+}
+
+// admit records the random and reports whether this is the first time we have
+// seen it inside the retention window.
+func (c *replayCache) admit(clientRandom []byte, now time.Time) bool {
 	key := string(clientRandom)
-	now := time.Now()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if seenAt, ok := c.seen[key]; ok && now.Sub(seenAt) < c.ttl {
-		return false
-	}
-	if len(c.seen) >= c.max {
-		for k, t := range c.seen {
-			if now.Sub(t) >= c.ttl {
-				delete(c.seen, k)
-			}
-		}
-		// Still full of live entries: drop the whole set rather than grow
-		// without bound. Forgetting is the safe direction — it costs replay
-		// protection for old randoms, not confidentiality.
-		if len(c.seen) >= c.max {
-			c.seen = make(map[string]time.Time, c.max)
+	c.rotate(now)
+
+	for _, gen := range c.generations {
+		if _, seen := gen[key]; seen {
+			return false
 		}
 	}
-	c.seen[key] = now
+
+	// At the ceiling, retire the oldest generation rather than everything.
+	// Replay protection is lost for the randoms in it and for nothing else.
+	for c.entries >= c.maxEntries {
+		if len(c.generations) == 1 {
+			// One generation has filled the entire budget on its own, which
+			// means arrivals outran the rotation interval. Start a new
+			// generation first, so the full one becomes the oldest and is
+			// retired in order — rather than clearing the set that holds the
+			// most recent randoms, which is the cliff this design removed.
+			c.generations = append(c.generations, make(map[string]struct{}))
+		}
+		c.dropOldest()
+	}
+
+	c.generations[len(c.generations)-1][key] = struct{}{}
+	c.entries++
 	return true
+}
+
+// rotate starts new generations for however many spans have elapsed, retiring
+// the oldest as it goes.
+func (c *replayCache) rotate(now time.Time) {
+	if c.span <= 0 {
+		return
+	}
+	for now.Sub(c.rotatedAt) >= c.span {
+		c.rotatedAt = c.rotatedAt.Add(c.span)
+		c.generations = append(c.generations, make(map[string]struct{}))
+		for len(c.generations) > c.keep {
+			c.dropOldest()
+		}
+		// A relay that was idle for a long time would otherwise spin through
+		// every elapsed span; once everything is retired there is nothing left
+		// to retire.
+		if c.entries == 0 && len(c.generations) >= c.keep {
+			c.rotatedAt = now
+			return
+		}
+	}
+}
+
+func (c *replayCache) dropOldest() {
+	c.entries -= len(c.generations[0])
+	c.generations = c.generations[1:]
+	if len(c.generations) == 0 {
+		c.generations = []map[string]struct{}{make(map[string]struct{})}
+	}
 }

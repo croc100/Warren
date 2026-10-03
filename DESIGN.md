@@ -743,6 +743,13 @@ recording today could be decrypted later.
 | ZK (only if attribute proofs are needed) | **gnark** (Go) or Noir/Halo2-class | libsnark is unmaintained and is removed from the stack |
 | RNG | OS CSPRNG (`getrandom`, `BCryptGenRandom`) | Unchanged |
 
+The ClientHello tag is `HMAC-SHA256` over the authentication secret, the client
+random, the client key share and a coarse 10-minute window index. The window is
+an input, not a wire field, so the hello is unchanged in size and structure; it
+is what stops a captured hello being replayable for as long as the relay's
+memory happens to last. It costs reachability for clients whose clock is wrong
+by more than the accepted slack, which is stated rather than hidden (§6.1).
+
 Retired from the earlier design: **the static PSK is gone** — authentication is now
 an X25519 exchange with the relay's long-term identity key, whose public half
 travels in the bridge descriptor; libsnark; and the Kyber draft groups superseded
@@ -788,7 +795,9 @@ kilobit link.
 | Relay pool enumeration | Censor harvesting the pool | No global list; rotating per-requester subsets; token-rate-limited discovery (§7.2) | Design changed, not started |
 | Discovery takedown | Blocking the bridge source | Multi-channel resolvers, signed expiring descriptors, no central API (§5) | Implemented |
 | Hostile discovery channel steering clients to a censor-run relay | Censor operating or tampering with a bridge channel | Signed descriptors covering each relay's identity key; resolvers fail closed without a trust anchor | Implemented |
-| Captured-hello replay | Probe re-sending a recorded hello | Bounded replay cache on `client_random`; a repeat is spliced to the real site (§6.1) | Implemented |
+| Captured-hello replay | Probe re-sending a recorded hello | A coarse time window inside the tag, so a captured hello stops verifying; plus a generational cache of `client_random` covering that window, a repeat being spliced (§6.1) | Implemented |
+| Answer-latency bimodality at one relay | Passive observer timing ClientHello to ServerHello | The relay waits out the borrowed site's measured answer time before its own ServerHello | Implemented, **partial** — the splice still pays one extra round trip; `cmd/probe` measures and reports the residual |
+| A gate that has silently stopped measuring | — (an own goal, not an adversary) | Canaries: the harness and the gate binary are pointed at deliberately-wrong relays and required to fail | Implemented |
 | Client distribution takedown | App-store removal orders | Reproducible builds, ≥3 non-app-store channels (§5.1) | Not started |
 | Throttling instead of blocking | State traffic management | Goodput-based health, degraded-vs-blocked signal (§7.3, §9) | Not started |
 | Sybil relays / malicious sellers | Profit-motivated or state-run nodes | Local-first reputation, collateral where settlement is on, path diversity | Not started |
@@ -867,7 +876,14 @@ Honest list of things this design does not yet answer.
 5. **Rung 5 of the ladder** (carriage over allowlisted domestic endpoints) is the
    most valuable and the most dangerous rung. It needs a per-region threat
    assessment before any implementation.
-6. **Analytics product-market fit** for a "degradation" signal, now that the
+6. **Clock dependence in the tag.** The freshness window makes a captured hello
+   expire, and in exchange a client whose clock is wrong by more than the slack
+   is silently unreachable — indistinguishable, from its own side, from being
+   censored. Devices without working time sync are not rare in exactly the
+   populations this is for. Whether a client can safely learn the time from a
+   channel a censor does not control, without that lookup becoming its own
+   signal, is unsolved.
+7. **Analytics product-market fit** for a "degradation" signal, now that the
    on-chain evasion log is gone, is an assumption and not yet validated with the
    NGO/research buyers the business plan names.
 

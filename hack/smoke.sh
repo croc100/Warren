@@ -16,6 +16,10 @@ set -euo pipefail
 
 RELAY_PORT="${RELAY_PORT:-18443}"
 SITE_PORT="${SITE_PORT:-19443}"
+# A second, unrelated site, used only by the gate canary at the end: the gate has
+# to reject a relay compared against a site it does not borrow from, or its PASS
+# on the real pair means nothing.
+OTHER_SITE_PORT="${OTHER_SITE_PORT:-19444}"
 SITE_SNI="${SITE_SNI:-www.example.com}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -114,6 +118,18 @@ for _ in $(seq 1 40); do
 done
 grep -q "site: listening" "$tmp/site.log" || { cat "$tmp/site.log"; fail "the stand-in site never came up"; }
 
+# The canary's site. Same code, its own process, so it mints its own
+# certificate — which is what makes it something the gate must not confuse with
+# the site the relay actually borrows.
+"$tmp/site" "$OTHER_SITE_PORT" "$SITE_SNI" > "$tmp/other-site.log" 2>&1 &
+pids+=($!)
+disown
+for _ in $(seq 1 40); do
+  if grep -q "site: listening" "$tmp/other-site.log" 2>/dev/null; then break; fi
+  sleep 0.5
+done
+grep -q "site: listening" "$tmp/other-site.log" || { cat "$tmp/other-site.log"; fail "the canary's second site never came up"; }
+
 step "measuring the site (an operator's cover-selection check)"
 "$tmp/node" -profile-only -profile-insecure \
   -fallback-addr="127.0.0.1:$SITE_PORT" -fallback-sni="$SITE_SNI" > "$tmp/profile.log" 2>&1 \
@@ -188,5 +204,24 @@ step "the L1 gate"
 }
 sed -n '/^probe /,$p' "$tmp/gate.log"
 expect "PASS" "$tmp/gate.log" "the gate did not report PASS"
+
+step "the gate's own failure path (canary)"
+# A gate that has quietly stopped working reports PASS, forever, and nothing
+# above would notice. So it is pointed at a pair it must reject: the same relay,
+# compared against a site it does not borrow from. Different certificate,
+# different everything — if this comes back PASS, or exits zero, then the
+# verdict printed above is not evidence of anything.
+#
+# The unit-test canaries (internal/network/probe/canary_test.go) cover the
+# individual measurements; this one covers the binary, which is the part CI and
+# a release actually gate on: the comparison running, the distinguishers being
+# counted, and os.Exit reflecting the count.
+if "$tmp/probe" -relay="127.0.0.1:$RELAY_PORT" -site="127.0.0.1:$OTHER_SITE_PORT" \
+  -sni="$SITE_SNI" -relay-key="$relay_pub" > "$tmp/canary.log" 2>&1; then
+  cat "$tmp/canary.log"
+  fail "the gate passed a relay compared against a site it does not borrow from; it is not measuring anything"
+fi
+expect "FAIL" "$tmp/canary.log" "the gate exited non-zero but did not report FAIL"
+echo "rejected, as it must be: $(grep -m1 '^FAIL' "$tmp/canary.log")"
 
 printf '\nsmoke: everything passed\n'
