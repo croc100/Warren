@@ -14,6 +14,15 @@ Status legend: ✅ done · 🚧 in progress · ⬜ planned
 > passing is **not** deployability: see the note under Slice 1.
 > Full status: [`DESIGN.md` §0](../DESIGN.md#0-implementation-status).
 
+> **Under review — [ADR 0002](adr/0002-state-scale-rebaseline.md) (proposed).**
+> Measured against a state-scale censor rather than a prober, the default
+> posture fails before Warren's protocol matters. A residential relay presents a
+> name it does not own, and acts as a server for strangers. Neither is visible to
+> Slice 1's gate. The ADR proposes to stop borrowing names, move residential
+> capacity onto household-shaped transports, make handshake-phase shaping
+> default, and replace the gate with five measurements. If it is accepted,
+> Slice 1 reopens.
+
 ---
 
 ## Why there are no dates
@@ -33,7 +42,7 @@ when a month ends.
 
 | # | Slice | Gate | Status |
 |---|-------|------|--------|
-| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | ✅ gate passes (Stage B of ADR 0001 remains conditional) |
+| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | ✅ gate passes (Stage B of ADR 0001 remains conditional) — **the gate itself is contested by ADR 0002** |
 | 2 | L1 breadth + L0 distribution | Fresh client still connects with UDP/443 blocked, primary transport blocked, and bridge list expired | ⬜ |
 | 3 | L2 relay pool | 20+ node testbed usable for interactive browsing while a 24h discovery-harvesting adversary recovers < stated fraction of the pool | ⬜ |
 | 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |

@@ -4,6 +4,13 @@
 > the way here — and why — are in [§14](#14-deprecated-decisions); what changed when
 > is in [`docs/CHANGELOG.md`](docs/CHANGELOG.md); the one architectural decision with
 > its own write-up is [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md).
+>
+> **[ADR 0002](docs/adr/0002-state-scale-rebaseline.md) (proposed) contests parts
+> of this document.** These are §6's borrowed-name default, §7.1's
+> residential-relay bet, §6.4's opt-in shaping, and §16's Slice 1 gate. It also
+> points out that §14's reason for removing SNI spoofing applies equally to
+> `tls-borrow` on a residential relay. Until it is decided, read §6, §7 and §16
+> with that ADR beside them.
 
 ## Table of Contents
 
@@ -883,7 +890,12 @@ Honest list of things this design does not yet answer.
    populations this is for. Whether a client can safely learn the time from a
    channel a censor does not control, without that lookup becoming its own
    signal, is unsolved.
-7. **Analytics product-market fit** for a "degradation" signal, now that the
+7. **Everything in [ADR 0002](docs/adr/0002-state-scale-rebaseline.md)'s
+   findings.** Name-to-address ownership, residential fan-in, the server's TCP/IP
+   stack, tunnelled-TLS shape, flow shape, reactions to induced faults (including
+   a censor skewing NTP to switch off item 6's tag window), and a gate that
+   checks self-consistency rather than survival.
+8. **Analytics product-market fit** for a "degradation" signal, now that the
    on-chain evasion log is gone, is an assumption and not yet validated with the
    NGO/research buyers the business plan names.
 
