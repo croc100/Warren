@@ -366,6 +366,18 @@ const sniffTimeout = 5 * time.Second
 const spliceDrainGrace = 5 * time.Second
 
 func serveConn(ctx context.Context, raw net.Conn, cfg Config, replays *replayCache, pool *warmPool, handle Handler) {
+	// A relay whose borrowed site is down refuses everyone, Warren clients
+	// included (ROADMAP H8). Serving tagged clients while every other connection
+	// fails would split one address into connections that become long TLS
+	// sessions and connections that get nothing — visible with no key at all. So
+	// every connection is treated alike and reset before a byte is read, the way
+	// a TCP front end with a dead backend behaves, and the relay comes back on its
+	// own once the pool's background dials reach the site again.
+	if !pool.siteReachable() {
+		resetClose(raw)
+		return
+	}
+
 	br := bufio.NewReaderSize(raw, maxRecordLen+recordHeaderLen)
 
 	raw.SetReadDeadline(time.Now().Add(sniffTimeout))
@@ -567,9 +579,8 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 	var upstreamReset atomic.Bool
 	defer func() {
 		if upstreamReset.Load() {
-			if tcp, ok := raw.(*net.TCPConn); ok {
-				tcp.SetLinger(0) // makes the following Close send an RST
-			}
+			resetClose(raw)
+			return
 		}
 		raw.Close()
 	}()
@@ -583,7 +594,13 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 		d := net.Dialer{Timeout: 5 * time.Second}
 		var err error
 		upstream, err = d.DialContext(ctx, "tcp", fallbackAddr)
+		pool.recordDial(ctx, err)
 		if err != nil {
+			// The site did not answer. Reset rather than close cleanly: a FIN
+			// after swallowing a ClientHello is a server that accepted and then
+			// had nothing to say, which no real site does (ROADMAP H8). The
+			// failure also counts toward refusing new connections outright.
+			upstreamReset.Store(true)
 			return
 		}
 	}
@@ -641,6 +658,15 @@ func spliceToFallback(ctx context.Context, raw net.Conn, br *bufio.Reader, fallb
 		case <-time.After(spliceDrainGrace):
 		}
 	}
+}
+
+// resetClose closes c with an RST rather than a FIN, where c is a TCP
+// connection; anything else is simply closed.
+func resetClose(c net.Conn) {
+	if tcp, ok := c.(*net.TCPConn); ok {
+		tcp.SetLinger(0) // makes the following Close send an RST
+	}
+	c.Close()
 }
 
 // resetWatchingWriter records whether writes to this particular side failed

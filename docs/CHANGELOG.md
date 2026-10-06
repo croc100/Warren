@@ -4,6 +4,42 @@ Newest first. This file records *why* things changed, since that is the part a d
 does not keep. Structural decisions live in [`DESIGN.md`](../DESIGN.md) §14 and in
 [`docs/adr/`](adr/).
 
+## 2026-10-07 — L1 hardening: a relay whose borrowed site is down refuses everyone
+
+ROADMAP H8. When the borrowed site stopped answering, the splice's dial failed
+and the relay closed the connection with a FIN — after accepting it and
+swallowing a ClientHello, which no real server does. Worse, Warren clients
+carried on being served the whole time. One address then had two behaviours:
+some connections became long-lived TLS sessions while every other one got
+nothing, and telling those apart needs no key.
+
+The relay now treats every connection alike. The warm pool, which already dials
+the site in the background, also keeps the verdict: `siteDownAfter` (two)
+consecutive failed dials, from the filler or from a splice, mark the site down,
+and any success brings it back. While it is down, `serveConn` resets each new
+connection before reading a byte — Warren clients included — which is how a TCP
+front end with a dead backend looks. A connection already in the splice when its
+dial fails is reset too, instead of closed with a FIN. Because the filler keeps
+dialing every refill tick, the relay starts serving again within a few seconds
+of the site returning, with no restart.
+
+Resetting after accept, rather than closing the listener so the port itself is
+refused, was a choice of scope: `Serve` does not own its listener, and handing
+re-binding to the caller is an API change. The difference between the two (an
+accepted-then-reset handshake against a refused SYN) is noted, not closed.
+
+One limit is stated in the code: the verdict only sees a site that refuses or
+drops TCP connections. A site that accepts them and rejects the relay at the TLS
+layer — DESIGN §15's open problem — still looks reachable.
+
+Tests: the reachability verdict on its own, including that dials abandoned on
+shutdown are not counted against the site; a splice whose dial fails ends in a
+reset; and end to end, a relay with a dead site resets both a probe and a genuine
+Warren client, then serves again once the site comes back. Both behaviour tests
+were checked against the fix reverted. The splice test first passed for the
+wrong reason — closing a socket with unread data makes the kernel send an RST on
+its own — so it now consumes the request first, the way `serveConn`'s peek does.
+
 ## 2026-10-03 — L1 hardening: warm upstream connections close the answer-path residual
 
 The 2026-10-01 pass equalised the *answer* time of the relay's two paths — a
