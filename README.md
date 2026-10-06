@@ -197,8 +197,16 @@ site, exactly like a probe), or `curl -v --http1.0 http://127.0.0.1:8443/`.
 
 ## Where it stands
 
-`cmd/probe` is the gate, and it exits non-zero on any distinguisher, so this table
-is measured rather than claimed. The gate is itself checked: canaries point the
+> **Read [ADR 0002](docs/adr/0002-state-scale-rebaseline.md) before this table.**
+> "Measured" below means a prober cannot tell a relay from the site it borrows.
+> A state-scale censor asks something else. Its first questions are whether the
+> name belongs to the address, and whether a home address is acting as a server
+> for strangers. The current default fails both before any row below applies.
+> Slice 1 is reopened to fix that.
+
+`cmd/probe` was the gate and is now a regression suite. It exits non-zero on any
+distinguisher it knows how to look for, so this table is measured rather than
+claimed. The gate is itself checked: canaries point the
 harness and the binary at relays that are deliberately wrong and fail if either
 reports PASS, because a harness that has quietly stopped measuring returns the
 same green as one that found nothing.
@@ -213,14 +221,17 @@ same green as one that found nothing.
 | Timing the answer to a ClientHello | The relay waits out the borrowed site's measured answer time, and keeps a few upstream connections warm so the splice does not pay a TCP connect the tagged path never spends — the two answer paths converge on the site's own latency | measured; a warm-connection pool closes the residual round trip, falling back to a fresh dial when the pool is empty or stale |
 | Recording now to decrypt later | Hybrid X25519 + ML-KEM-768, forward secret per connection | implemented |
 | Hostile discovery channel | Signed, expiring descriptors covering each relay's identity key; resolvers fail closed without an anchor | implemented |
-| **A censor that runs a Warren client** | Nothing here stops it: it holds a valid tag and can see the flight is synthetic | **accepted gap** — it can enumerate bridges anyway, which is an L2 problem |
+| **Name not owned by the address; home address acting as a server** | Nothing yet: `tls-borrow` on a residential relay fails both | **open, critical** — ADR 0002 F1/F2, Slice 1 M1–M4 |
+| **A censor that runs a Warren client** | Nothing here stops it yet: it holds a valid tag and can see the flight is synthetic | **open** — no longer accepted (ADR 0002 F9); mandatory credentials, Slice 1 M9 |
 | **TLS-intercepting middlebox (a state CA)** | A real session survives interception; Warren's would break | **open** — [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md) Stage B |
 | **Statistical flow classification of traffic** | Handshake shape matches; *data* shape does not | **not started** — [`DESIGN.md` §6.4](DESIGN.md#64-traffic-shaping-with-a-cost-model) |
 | **Relay-pool enumeration** | No rotating subsets, no rate limiting | **not started** |
 
-So: the handshake stands up to measurement, and everything after it does not yet.
-Do not point this at a censored network expecting it to hold — the traffic-shape
-work and the relay pool are both unbuilt, and a real deployment needs both.
+So: the handshake stands up to a prober, and not yet to a censor. Do not point
+this at a censored network expecting it to hold. The default posture is being
+rebuilt (ADR 0002), the traffic-shape work and the relay pool are unbuilt, and
+nothing is offered to users before ADR 0002's G5: a measurement from inside the
+network and an external review.
 
 ---
 
