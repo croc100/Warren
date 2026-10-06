@@ -5,12 +5,10 @@
 > is in [`docs/CHANGELOG.md`](docs/CHANGELOG.md); the one architectural decision with
 > its own write-up is [ADR 0001](docs/adr/0001-borrowed-tls-handshake.md).
 >
-> **[ADR 0002](docs/adr/0002-state-scale-rebaseline.md) (proposed) contests parts
-> of this document.** These are §6's borrowed-name default, §7.1's
-> residential-relay bet, §6.4's opt-in shaping, and §16's Slice 1 gate. It also
-> points out that §14's reason for removing SNI spoofing applies equally to
-> `tls-borrow` on a residential relay. Until it is decided, read §6, §7 and §16
-> with that ADR beside them.
+> **[ADR 0002](docs/adr/0002-state-scale-rebaseline.md) (accepted 2026-10-07)
+> re-baselines this design against a state-scale censor.** §6.3–§6.5, §7.1, §13,
+> §14 and §16 are rewritten to match. Where any older passage here disagrees with
+> that ADR, the ADR wins.
 
 ## Table of Contents
 
@@ -44,7 +42,7 @@ things work:
 |-------|-----------|--------|
 | L0 | `internal/discovery/bootstrap` — multi-channel bridge resolution (DNS TXT / file / static), signed and expiring descriptors, partial-failure tolerant | **Implemented + tested** |
 | L1 | `internal/network/transport` — tagged ClientHello with real-site fallback splice, hybrid post-quantum session handshake (X25519 + ML-KEM-768), TLS-record framing, replay cache, measured borrowed-site flight imitation | **Implemented + tested (known gaps)** |
-| L1 | `internal/network/probe`, `cmd/probe` — active-probe suite and record-shape comparison against the borrowed site; the gate | **Implemented + tested** |
+| L1 | `internal/network/probe`, `cmd/probe` — active-probe suite and record-shape comparison against the borrowed site. Formerly the release gate, now a regression suite under ADR 0002's G2/G3 | **Implemented + tested** |
 | L2 | Relay pool, routing, reputation | Not started |
 | L3 | Payment channels, settlement | Not started. The earlier Solidity sketches were deleted rather than kept: they described a design §8 has since replaced |
 | L4 | Measurement / analytics | Not started |
@@ -427,14 +425,26 @@ per-region by the degradation ladder (§6.5):
 
 | Transport | Shape on the wire | Notes |
 |-----------|-------------------|-------|
-| `tls-borrow` (current) | TLS 1.3 to a real site, tagged hello, real-site fallback | Strongest against active probing; TCP only |
+| `self-cover` | TLS 1.3 to a real site the relay itself hosts, under an operator-owned domain with a publicly trusted certificate; tagged hello; unauthenticated connections get that site from the relay's own stack | **Default server-shaped transport** (ADR 0002 D1.1). The name resolves to the address, so name/address ownership agrees by construction. Domains are the blocking unit, so they are cheap, numerous and rotated |
+| `front` | TLS 1.3 to a CDN or hosting front that answers for many names; the client-facing name is the front's, sent via ECH where available | ADR 0002 D1.2. Ownership is genuinely ambiguous. Depends on the front not being blocked wholesale and on ECH surviving in the region, which is measured per region |
+| `tls-borrow` (built) | TLS 1.3 to a borrowed real site, tagged hello, real-site fallback splice | **Restricted** (ADR 0002 D1.3): datacenter relays in the same provider and prefix as the site they borrow, never residential. It refuses to start otherwise. Strongest against active probing; TCP only |
 | `masque` | HTTP/3 over QUIC; `CONNECT-UDP` (RFC 9298) / `CONNECT-IP` (RFC 9484) | Standards-based proxying, indistinguishable from the growing volume of real MASQUE traffic (Apple iCloud Private Relay, Cloudflare WARP). Dies wherever UDP/443 is blocked — which is common |
 | `websocket-tunnel` | Long-lived WSS inside an ordinary HTTPS site | The Tor WebTunnel pattern: cheap to host behind a real CDN-fronted site |
-| `rendezvous` | Browser-sourced WebRTC (Snowflake pattern) | Last-resort reachability when all fixed relays are blocked; low throughput |
+| `rendezvous` | WebRTC between peers (Snowflake pattern) | **The primary way residential capacity is reached** (ADR 0002 D2). Household-to-household media is ordinary residential traffic. Lower throughput |
+| `outbound-hop` | A residential relay dials out to a fronted rendezvous and carries traffic over that connection | ADR 0002 D2. A residential address never accepts inbound connections from strangers. The rendezvous is a new centralisation point and is itself fronted and rotated |
 
 Selection is a policy, and policies are local. The client never receives "use
 transport X" as an instruction from the network without verifying it against a
 signed bridge descriptor.
+
+Every transport on the default ladder must pass ADR 0002's G1–G4 continuously.
+A transport that cannot is removed from the ladder, not shipped with a note.
+
+Every transport also requires a **client credential** inside the tag, encrypted
+under the authentication secret. A tag that verifies against the relay's key but
+carries no valid credential is treated as unauthenticated. This makes every
+harvested relay attributable to the distribution bucket that leaked it, which is
+what L2's anti-enumeration needs (§7.2; ADR 0002 F9).
 
 ### 6.4 Traffic shaping, with a cost model
 
@@ -444,13 +454,22 @@ unusable for two reasons: no overhead budget, and — in a network where relays 
 per gigabyte (§8) — constant-rate cover traffic means **paying a relay to carry
 noise**, continuously, on a residential uplink.
 
-Revised: three named regimes, client-selectable, each with a stated cost.
+Revised again by ADR 0002: there is no unshaped regime. Tunnelled TLS shows
+through an unshaped transport cheaply (ADR 0002 F4), so shaping is part of the
+transport's price, stated up front, rather than an option the user may forget to
+turn on.
 
 | Regime | Mechanism | Overhead | When |
 |--------|-----------|----------|------|
-| `off` | No shaping beyond the transport's own record sizes | 0% | Default for throughput-bound use (VDI, bulk) |
-| `bucket` | Payload padded to a small set of fixed sizes; no injected idle traffic | Bounded, typically <15% of carried bytes | Default for interactive browsing |
+| `minimal` | The first 16 KB of each inner stream coalesced, split into bucket sizes and send-jittered; inner streams multiplexed. Replaces `off` | Concentrated in the first round trips of each inner connection; measured and published per release | **Floor for everything.** Default for throughput-bound use (VDI, bulk) |
+| `bucket` | `minimal`, plus every payload padded to a small set of fixed sizes for the whole session; no injected idle traffic | Bounded, typically <15 % of carried bytes; measured and published | **Default for interactive browsing** |
 | `cover` | `bucket` plus constant-rate cover during idle, rate-capped and duty-cycled | Explicit: a configured bytes/hour ceiling the user opts into and pays for | Only where a named local threat justifies it |
+
+Shaping is joined by **flow budgets** (ADR 0002 D4). Connections rotate on
+duration and volume budgets measured from the cover's real visits. Load spreads
+over a browser-like number of parallel connections. Idle connections close
+rather than hold keepalives. A tunnel is never one long flow that no visit to
+the cover would produce.
 
 The mechanism these regimes need already exists: every Warren record's plaintext
 starts with a kind byte, and filler records are discarded by the peer without ever
@@ -461,25 +480,40 @@ than a new wire format.
 Honesty requirement: `cover` raises the cost of website-fingerprinting attacks; it
 does not defeat a determined classifier, and published padding-defense results
 (Tor's padding machines onward) are a record of partial mitigation, not solution.
-The doc must not claim otherwise, and the default must not be a regime whose bill
-the user did not agree to.
+The doc must not claim otherwise. Whether a regime is good enough is decided by
+ADR 0002's G2 classifier gate at a 10⁻⁴ false-positive rate, per regime, not by
+this table. The cost of `minimal` and `bucket` is stated before a user installs,
+which is what "agreed to" means for a regime that cannot be switched off.
 
 ### 6.5 Degradation ladder
 
 The client walks down this ladder and reports which rung it is on. Each rung is a
 weaker but more survivable posture:
 
+Re-ordered by ADR 0002. No rung puts a residential address in the role of a
+server for strangers, and none presents a name the destination does not own.
+
 ```
-1. tls-borrow to a nearby residential relay            (normal operation)
-2. tls-borrow / websocket-tunnel behind a real CDN-fronted site
+1. self-cover on a hosting address, or front / websocket-tunnel
+   behind a CDN                                        (normal operation)
+2. rendezvous (WebRTC) or outbound-hop to residential
+   capacity                                            (household-shaped; lower
+                                                        throughput)
 3. masque to a large shared provider endpoint          (blends with real MASQUE)
-4. rendezvous (WebRTC/Snowflake pattern)               (throughput collapses)
+4. tls-borrow, co-located datacenter relays only       (where a region's fronts
+                                                        and own-domain names are
+                                                        blocked)
 5. domestic-permitted-endpoint carriage                (where any allowlisted
    endpoint can carry bytes; regionally specific, high risk, opt-in only)
 6. mesh / store-and-forward                            (no foreign reachability;
    local control plane only, see §10)
 7. offline: local cache serving only
 ```
+
+Moving down the ladder follows browser-like backoff and is never an immediate
+reaction to one RST or one stall. A client that switches transports the moment
+it is perturbed tells the censor that it has alternatives, and where they are
+(ADR 0002 F6).
 
 Rungs 5 and 6 are where an allowlist regime (§1.1) puts users, and both are honest
 about what they cannot do. The ladder's existence is the design's answer to
@@ -500,19 +534,32 @@ major CDNs disabled cross-domain SNI/Host mismatch. So:
 
 ```
 Layer 1 (structural):  a large pool of ordinary residential relays, churning as
-                       sellers join and leave
+                       sellers join and leave, that LOOK LIKE HOUSEHOLDS
                        -> the censor's blocking cost scales with the number of
-                          households, not the number of VPN companies
+                          households, but only while detecting one costs more
+                          than a query over flow logs
 
 Layer 2 (protocol):    per-connection camouflage (§6)
-                       -> each connection looks like a real visit to a real site,
-                          to passive DPI, statistical classifiers, and probes
+                       -> each connection looks like a real visit to a site that
+                          really is at that address, to passive DPI, joins
+                          across flows, statistical classifiers, and probes
 ```
 
-This composes two independently proven patterns — large ephemeral proxy pools
-(Psiphon/Snowflake) and probe-resistant TLS borrowing (REALITY) — rather than
-inventing one. Module 1 is therefore **primary censorship infrastructure**, not
-just a revenue mechanism.
+The earlier version of this section said a residential relay should accept
+camouflaged TLS from clients directly. ADR 0002 (F1, F2) showed that is
+detectable without touching the protocol. A home address presenting a foreign
+site's name, and serving long sessions to hundreds of strangers, is found by one
+join over DNS and flow logs. Blocking is per address, so churn helps less than
+assumed.
+
+So residential capacity is reached only in shapes that residential addresses
+really have: peer-to-peer WebRTC, and outbound-only hops to a fronted rendezvous
+(§6.3). Server-shaped roles run on hosting or CDN-fronted addresses, under names
+they own. This composes three proven patterns — Snowflake's temporary WebRTC
+proxies, fronted transports (Tor WebTunnel, Conjure-class), and probe-resistant
+TLS (REALITY, restricted to co-location) — rather than inventing one. Module 1 is
+still **primary censorship infrastructure**, but a smaller and lower-throughput
+product than "sell your home connection as an inbound relay" (§15, item 2).
 
 ### 7.2 Enumerability is the real adversary
 
@@ -795,9 +842,15 @@ kilobit link.
 | Handshake-shape classification | Passive classifier measuring record sizes | Flight shaped from a live measurement of the borrowed site, including session tickets and the client Finished size (§6.1) | Implemented, measured by `cmd/probe` |
 | Imitating a site that cannot plausibly answer | Passive classifier comparing the first server packet | Profiles that do not negotiate `X25519MLKEM768` are rejected; a relay without a usable profile refuses to serve | Implemented |
 | TCP teardown fingerprinting | Passive observer comparing how connections end | The splice mirrors an upstream reset instead of closing cleanly | Implemented |
-| Censor running its own Warren client | Adversary holding a valid tag | Nothing at L1: it can see the flight carries no verifiable certificate. Accepted — it can enumerate bridges through discovery regardless, which is §7.2's problem | Accepted gap |
+| Censor running its own Warren client | Adversary holding a valid tag — the default, not an edge case (ADR 0002 C4) | `self-cover` presents a real certificate for a name the relay owns. A mandatory client credential makes each harvested relay attributable to the bucket that leaked it (§6.3, §7.2) | **No longer accepted.** Not started |
+| Name not owned by the address | Join of SNI against passive DNS and the client's own resolution history (ADR 0002 F1) | `self-cover` and `front` only; `tls-borrow` restricted to co-location (§6.3) | Not started; G1 measures it |
+| Residential address acting as a server | Per-address fan-in and session-duration aggregates (F2) | No residential server role; residential capacity only via WebRTC and outbound hops (§7.1) | Not started; G1 measures it |
+| Server TCP/IP stack and port surface | SYN-ACK fingerprinting (JA4T-class), port scan of the relay address (F3) | Relays run a stack and port surface matching the server class they claim | Not started; G3 measures it |
+| Tunnelled TLS showing through | Encapsulated-handshake classifier (Xue et al. 2024) (F4) | `minimal` shaping as a floor, `bucket` default for interactive traffic, multiplexed inner streams (§6.4) | Not started; G2 measures it |
+| Flow shape unlike a visit | Duration, byte ratio and idle structure per flow (F5) | Flow budgets: rotation, parallelism, idle close (§6.4) | Not started; G2 measures it |
+| Induced faults, including NTP skew | RST injection, loss, clock manipulation to observe or disable clients (F6) | Browser-like reconnect backoff; relay-issued freshness tickets in place of absolute time (§6.5, §11) | Not started; G4 measures it |
 | TLS-interception by a state CA | Middlebox terminating TLS | A real session survives interception; Warren's breaks | Open ([ADR 0001](docs/adr/0001-borrowed-tls-handshake.md) Stage B) |
-| Statistical flow classification | State classifier | Shaping regimes with stated cost (§6.4) | Not started |
+| Statistical flow classification | State classifier | Shaping on by default with stated cost, plus flow budgets (§6.4) | Not started; G2 measures it |
 | IP/ASN blocklisting | Bulk range blocking | Residential pool scale + churn (§7.1) | Not started |
 | Relay pool enumeration | Censor harvesting the pool | No global list; rotating per-requester subsets; token-rate-limited discovery (§7.2) | Design changed, not started |
 | Discovery takedown | Blocking the bridge source | Multi-channel resolvers, signed expiring descriptors, no central API (§5) | Implemented |
@@ -860,6 +913,12 @@ knows what changed.
 | Unbounded "health" formula compared to 0.6 | Corrected | Re-specified as normalized [0,1] with hysteresis (§10.1) |
 | Five node types | Simplified | Three roles: client / relay / exit — and relay≠exit is a safety property (§4, §7.4) |
 | Month-numbered roadmap | Replaced | Falsifiable gates (§16) |
+| `tls-borrow` as the default transport, on residential relays | **Restricted** (ADR 0002) | Presenting a name the address does not own is the SNI-spoofing distinguisher above with a better handshake. Kept only for datacenter relays co-located with their site |
+| Residential relays accepting inbound connections from clients | **Removed** (ADR 0002) | A home address serving long sessions to strangers is found by one join over flow logs. Residential capacity is reached by WebRTC and outbound hops |
+| `off` shaping regime as the default for bulk traffic | **Removed** (ADR 0002) | Unshaped tunnels expose inner TLS handshakes; `minimal` is the floor |
+| "A censor running a Warren client" as an accepted gap | **Reversed** (ADR 0002) | A state holds unlimited clients. Mandatory credentials make harvesting attributable |
+| `cmd/probe` as the release gate | **Superseded** (ADR 0002) | It measures a prober, not a censor. Now a regression suite under G1–G5 |
+| Absolute-time freshness window as the only replay defence | **Superseded** (ADR 0002) | A censor that skews NTP turns it into an off switch for every client in a region. Relay-issued tickets instead |
 
 ---
 
@@ -890,11 +949,15 @@ Honest list of things this design does not yet answer.
    populations this is for. Whether a client can safely learn the time from a
    channel a censor does not control, without that lookup becoming its own
    signal, is unsolved.
-7. **Everything in [ADR 0002](docs/adr/0002-state-scale-rebaseline.md)'s
-   findings.** Name-to-address ownership, residential fan-in, the server's TCP/IP
-   stack, tunnelled-TLS shape, flow shape, reactions to induced faults (including
-   a censor skewing NTP to switch off item 6's tag window), and a gate that
-   checks self-consistency rather than survival.
+7. **[ADR 0002](docs/adr/0002-state-scale-rebaseline.md)'s open questions.**
+   - Whether ECH survives in target regions, which decides how much `front` can
+     carry.
+   - How the rendezvous for outbound residential hops avoids becoming the single
+     blockable point.
+   - How the mandatory client credential stays unlinkable across sessions while
+     still attributing a leak.
+   - Whether G2's threshold (≤ 1 % TPR at 10⁻⁴ FPR) is the right bar against
+     published censor behaviour.
 8. **Analytics product-market fit** for a "degradation" signal, now that the
    on-chain evasion log is gone, is an assumption and not yet validated with the
    NGO/research buyers the business plan names.
@@ -910,7 +973,7 @@ the two documents cannot drift.
 
 | # | Slice | Gate | Status |
 |---|-------|------|--------|
-| 1 | L1 transport hardening | `cmd/probe` finds nothing that separates a relay from the site it borrows | ✅ passing |
+| 1 | L1 re-baseline (ADR 0002) | G1–G4 pass continuously on main with canaries: join test, classifier at 10⁻⁴ FPR, stack parity, fault response. No waivers | 🚧 reopened. The earlier probe gate still passes, as Slice 1a |
 | 2 | L1 breadth + L0 distribution | A fresh client still connects with UDP/443 blocked, the primary transport blocked, and its bridge list expired | ⬜ |
 | 3 | L2 relay pool | A 20+ node testbed stays usable while a 24-hour discovery-harvesting adversary recovers less than a stated fraction of the pool | ⬜ |
 | 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |
@@ -920,9 +983,12 @@ the two documents cannot drift.
 Warren DNS, Email and Storage are not scoped until Slice 3's gate is met: a name
 service over an unproven transport is a demo, not a product.
 
-**Slice 1 passing is not deployability.** The gate covers the handshake; the shape
-of application traffic after it (§6.4) and relay-pool enumeration (§7.2) are both
-untouched, and a real deployment needs both.
+**Deployability is gated separately, by G5.** Even with G1–G4 passing, Warren is
+not offered to anyone in a censored network before a measurement from inside that
+network and an external review, repeated for every region added. The earlier
+note here — that a passing Slice 1 was not deployability — turned out to
+understate the problem. ADR 0002 showed the old gate could pass while the
+default posture failed outright.
 
 ---
 

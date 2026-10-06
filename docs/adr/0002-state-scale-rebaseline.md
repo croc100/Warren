@@ -1,6 +1,7 @@
 # ADR 0002 — Re-baseline L1 against a state-scale censor
 
-- **Status:** Proposed (2026-10-07)
+- **Status:** Accepted (2026-10-07), with the tightening in
+  [§Accepted with these terms](#accepted-with-these-terms)
 - **Scope:** L1 as a whole, the relay-placement bet in [`DESIGN.md` §7.1](../../DESIGN.md),
   the degradation ladder (§6.5), and how every slice's gate is measured
 - **Amends:** [ADR 0001](0001-borrowed-tls-handshake.md). Its stages stand as
@@ -326,9 +327,39 @@ The thresholds are a starting proposal. They are meant to be argued with, but
 only by changing the numbers, never by dropping the gate. `cmd/probe` stays as a
 regression suite under G2/G3.
 
+## Accepted with these terms
+
+The project accepted this ADR and asked for it to be applied more strictly than
+proposed. These terms override anything softer above.
+
+1. **No waivers.** A transport that cannot pass G1–G4 is removed from the
+   default ladder, not shipped with a known-issues note. The gate's thresholds
+   can be argued with numbers. A failing gate cannot be argued around.
+2. **Every finding gets a canary.** F1–F10 each get a test that builds the
+   distinguisher deliberately and requires the matching gate to catch it. This
+   is the same discipline as the probe canaries, for the same reason: a gate
+   that reports nothing looks identical to a gate that measures nothing.
+3. **Shaping defaults to `bucket` for interactive traffic, not `minimal`.**
+   D3's `minimal` (handshake phase only) remains the floor for bulk and VDI
+   traffic, where its cost is justified per session. Interactive browsing is
+   the traffic F4 and F5 target, and its default is the stronger regime.
+4. **No relay serves a client without a credential.** D5's credential is
+   mandatory, not optional. A tag that verifies against the relay's key but
+   carries no valid credential is treated like any unauthenticated connection.
+   This makes every harvested relay attributable to the bucket that leaked it,
+   which is the precondition for F9's defence.
+5. **Gates run continuously.** G1–G4 run on a schedule against the current
+   main branch, not only at release time. A regression is a release blocker
+   from the day it appears. G5 is required before Warren is offered to any user
+   in a censored network, and repeated for every region added.
+6. **The residential server role is gone, not deprecated.** No configuration
+   flag lets a residential relay accept inbound connections from strangers. An
+   operator who wants to serve inbound runs on a hosting address (D2).
+
 ## What happens to the current code
 
-Nothing is deleted on this ADR's acceptance. It re-labels.
+Accepting this ADR does not delete anything by itself. It re-labels, and the
+work it creates is tracked in [`docs/ROADMAP.md`](../ROADMAP.md) Slice 1.
 
 | Component | Fate |
 |-----------|------|

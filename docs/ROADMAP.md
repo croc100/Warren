@@ -14,14 +14,16 @@ Status legend: ✅ done · 🚧 in progress · ⬜ planned
 > passing is **not** deployability: see the note under Slice 1.
 > Full status: [`DESIGN.md` §0](../DESIGN.md#0-implementation-status).
 
-> **Under review — [ADR 0002](adr/0002-state-scale-rebaseline.md) (proposed).**
-> Measured against a state-scale censor rather than a prober, the default
-> posture fails before Warren's protocol matters. A residential relay presents a
-> name it does not own, and acts as a server for strangers. Neither is visible to
-> Slice 1's gate. The ADR proposes to stop borrowing names, move residential
-> capacity onto household-shaped transports, make handshake-phase shaping
-> default, and replace the gate with five measurements. If it is accepted,
-> Slice 1 reopens.
+> **Re-baselined — [ADR 0002](adr/0002-state-scale-rebaseline.md) (accepted
+> 2026-10-07).** Measured against a state-scale censor rather than a prober, the
+> old default failed before Warren's protocol mattered. A residential relay
+> presented a name it did not own, and acted as a server for strangers. Slice 1
+> is reopened:
+> - relays stop borrowing names;
+> - residential capacity moves onto household-shaped transports;
+> - shaping is on by default;
+> - every relay requires a client credential;
+> - five gates replace `cmd/probe` as the release gate, with no waivers.
 
 ---
 
@@ -42,7 +44,7 @@ when a month ends.
 
 | # | Slice | Gate | Status |
 |---|-------|------|--------|
-| 1 | L1 transport hardening | Active-probe harness can't distinguish a relay from the site it borrows; ClientHello not distinguishable from the parroted browser's current profile | ✅ gate passes (Stage B of ADR 0001 remains conditional) — **the gate itself is contested by ADR 0002** |
+| 1 | L1 re-baseline | ADR 0002's G1–G4 pass continuously on main, each with canaries for the findings it covers: join test, classifier (≤ 1 % TPR at 10⁻⁴ FPR), stack parity, fault response | 🚧 reopened. The old probe gate still passes and is now a regression suite |
 | 2 | L1 breadth + L0 distribution | Fresh client still connects with UDP/443 blocked, primary transport blocked, and bridge list expired | ⬜ |
 | 3 | L2 relay pool | 20+ node testbed usable for interactive browsing while a 24h discovery-harvesting adversary recovers < stated fraction of the pool | ⬜ |
 | 4 | L3 accounting | A week of paid relay traffic with zero on-chain transactions; separately, net settlement on an L2 testnet with no per-session data on chain | ⬜ |
@@ -51,10 +53,53 @@ when a month ends.
 
 ---
 
-## Slice 1 — L1 transport hardening ✅ (gate passing)
+## Slice 1 — L1 re-baseline 🚧 (reopened by ADR 0002)
 
-The layer everything else depends on. If a connection can be detected or probed,
-no amount of marketplace or analytics matters.
+The layer everything else depends on. ADR 0002 showed the earlier gate measured
+a prober, not a censor, so the slice restarts against the censor. The probe-
+resistance work below it (Slice 1a) is done and kept, but now belongs only to
+`tls-borrow`. That transport is restricted to datacenter relays co-located with
+the site they borrow.
+
+Ordered so that the measurements come before the mechanisms they judge — the
+lesson of ADR 0001 Stage 0, applied again.
+
+### 1b — Gates first
+
+| # | Item | Covers |
+|---|------|--------|
+| G1 | ⬜ **Join-test pipeline.** A censor-side job over testbed flow and DNS logs: SNI-to-address ownership, resolution history, address-space type (residential / hosting / CDN), per-address fan-in and session duration. Baseline: real hosts of the same class | F1, F2, F7 |
+| G2 | ⬜ **Classifier gate.** Train on real browser traffic to the cover versus Warren traffic. Features: first-N packet sizes and timings, flow statistics. Reimplement Xue et al.'s encapsulated-handshake detector alongside. Report TPR at 10⁻⁴ FPR per shaping regime; pass ≤ 1 %. Publish the training sets | F4, F5, F8 |
+| G3 | ⬜ **Stack parity.** SYN-ACK and TCP behaviour (TTL, window, option order, ECN, initial cwnd, retransmission) against the claimed server class; a port scan of the relay address | F3 |
+| G4 | ⬜ **Fault harness.** RST injection, loss, MSS clamping and ±1 h clock skew against clients; reconnect timing compared with a browser envelope | F6 |
+| G5 | ⬜ **Outside eyes.** At least one in-country vantage point and an external review. Required before Warren is offered to anyone in a censored network, and repeated per region | F8, F10 |
+| — | ⬜ **Canaries for F1–F10.** Each finding is built deliberately and the matching gate must catch it | all |
+| — | ⬜ **Scheduled runs.** G1–G4 run against main on a schedule; a regression blocks release from the day it appears | — |
+
+### 1c — Mechanisms
+
+| # | Item | Decision |
+|---|------|----------|
+| M1 | ⬜ **`self-cover` transport.** The relay serves a real site under an operator-owned domain with a publicly trusted certificate. Unauthenticated connections get that site from the relay's own TLS stack: no splice, no remote profile, no warm pool | D1.1 |
+| M2 | ⬜ **`front` transport.** The relay sits behind a CDN or hosting front; the client-facing name is the front's, via ECH where available. ECH reachability per region is measured before this ships as a default | D1.2 |
+| M3 | ⬜ **Restrict `tls-borrow`.** It refuses to start unless the relay and the borrowed site share a provider and prefix. It refuses to start on a residential address | D1.3 |
+| M4 | ⬜ **No residential server role.** No configuration lets a residential relay accept inbound from strangers. Residential capacity is reached by WebRTC (Snowflake pattern) and by outbound-only hops to a fronted rendezvous | D2 |
+| M5 | ⬜ **Shaping on by default.** `bucket` for interactive traffic. `minimal` (first 16 KB of each inner stream coalesced, split and jittered) is the floor for bulk and VDI. Inner streams are multiplexed. Overhead is measured and published | D3 |
+| M6 | ⬜ **Flow budgets.** Connections rotate on duration and volume budgets measured from the cover. Load spreads over a browser-like number of parallel connections. Idle connections close | D4 |
+| M7 | ⬜ **Fault behaviour.** Browser-like reconnect backoff. No relay rotation in immediate reaction to an RST or a stall | D5 |
+| M8 | ⬜ **Freshness without absolute time.** A relay-issued expiring ticket from the previous session. First contact uses a wider window backed by a replay cache that survives restarts (H9) | D5 |
+| M9 | ⬜ **Mandatory client credential in the tag.** It is encrypted under the authentication secret inside the spare 16 bytes of `session_id`. A missing or invalid credential is treated as unauthenticated. Unlinkability across sessions is an open design question (ADR 0002 §Open questions 3) | D5, F9 |
+
+**Gate:** G1–G4 pass on main with their canaries, for every transport in the
+default ladder. A transport that cannot pass is removed from the ladder, not
+waived.
+
+---
+
+## Slice 1a — probe resistance ✅ (done; now `tls-borrow` only)
+
+The earlier Slice 1. Its gate, `cmd/probe` finding nothing that separates a
+relay from the site it borrows, still passes and now runs as a regression suite.
 
 - ✅ Tagged TLS ClientHello + byte-for-byte fallback splice to a real site
   (`internal/network/transport`), verified end-to-end against a real HTTP server
@@ -205,19 +250,28 @@ One transport and two app stores are both single points of failure.
 - ⬜ `websocket-tunnel` transport (Tor WebTunnel pattern, behind a fronted site)
 - ⬜ Transport selection policy + degradation ladder rungs 1–4
 - ⬜ Reproducible builds, signed artifacts, ≥3 non-app-store distribution channels
-- ⬜ Shaping regimes `bucket` and `cover`, each with measured overhead published
+- ⬜ `cover` shaping regime, with measured overhead published (`bucket` and
+  `minimal` moved to Slice 1, M5)
 
 **Gate:** with UDP/443 blocked, the primary transport blocked, and the newest
 signed bridge list expired, a fresh install still reaches the network and reports
-which rung of the ladder it is on.
+which rung of the ladder it is on. Every transport on the ladder also passes
+Slice 1's G1–G4.
 
 ---
 
 ## Slice 3 — L2 relay pool ⬜
 
 The structural anti-blocklisting bet: many ordinary residential endpoints,
-churning, non-enumerable.
+churning, non-enumerable — and, since ADR 0002, **looking like households**.
+Residential relays are reached by WebRTC and by outbound-only hops, never as
+inbound servers (Slice 1, M4).
 
+- ⬜ Hardened rendezvous for outbound residential hops. It is the new
+  centralisation point, so it is fronted and rotated itself (ADR 0002 §Open
+  questions 2)
+- ⬜ Credential-bucketed distribution (Lox / rdsys pattern), so each harvested
+  relay is attributable to the bucket that leaked it (F9; needs Slice 1, M9)
 - ⬜ Relay / exit role separation — a default install is **relay only**
 - ⬜ Declared, locally enforced exit policy + abuse-handling documentation
 - ⬜ Goodput- and completion-based health (throttling detection, not just reachability)
@@ -226,7 +280,8 @@ churning, non-enumerable.
 
 **Gate:** a 20+ node testbed sustains usable interactive browsing while an
 adversary process harvesting discovery responses for 24 hours recovers less than a
-pre-stated fraction of the pool.
+pre-stated fraction of the pool. The residential nodes are not flagged by G1's
+join test at a rate above real households.
 
 ---
 

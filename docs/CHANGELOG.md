@@ -4,6 +4,49 @@ Newest first. This file records *why* things changed, since that is the part a d
 does not keep. Structural decisions live in [`DESIGN.md`](../DESIGN.md) §14 and in
 [`docs/adr/`](adr/).
 
+## 2026-10-07 — ADR 0002 accepted: re-baseline against a state-scale censor
+
+After the H3–H8 hardening the probe gate had nothing left to find, and that was
+the problem. It measured whether a prober could tell a relay from its borrowed
+site. A national censor asks whether a flow is plausible given DNS, IP ownership,
+address-space type and every other flow at the address, and it answers by
+joining logs, not by probing. Against that question the default posture failed
+before Warren's protocol mattered. A residential relay presented a foreign
+site's name it did not own: DESIGN §14 had already rejected SNI spoofing for
+that very reason. And it served long sessions to strangers from a home address.
+
+[ADR 0002](adr/0002-state-scale-rebaseline.md) models the censor by capability,
+ranks ten distinguishers by what they cost to exploit, and decides the rework.
+The project accepted it and tightened it on acceptance:
+
+- no waivers for failing gates;
+- a canary for every finding;
+- `bucket` shaping by default for interactive traffic;
+- a mandatory client credential in the tag;
+- gates running continuously;
+- the residential server role removed outright rather than deprecated.
+
+What changed in the documents:
+
+- **DESIGN**
+  - §6.3 gains `self-cover`, `front` and `outbound-hop`, and restricts
+    `tls-borrow` to co-located datacenter relays.
+  - §6.4 drops the unshaped regime for a `minimal` floor and adds flow budgets.
+  - §6.5's ladder is re-ordered so that no rung makes a home address a server.
+  - §7.1 is rewritten around relays that look like households.
+  - §13 gains the new threats and reverses the "censor runs a client" accepted
+    gap.
+  - §14 records six superseded decisions.
+  - §16 reopens Slice 1.
+- **ROADMAP:** Slice 1 is reopened, with gates G1–G5 ahead of mechanisms M1–M9.
+  The earlier work becomes Slice 1a, and Slices 2 and 3 now inherit the new
+  gates.
+- **README:** the security table is prefaced with what it does not measure.
+
+No code changed. Nothing is deleted yet. The `tls-borrow` machinery, including
+the H3/H7/H8 work, stays correct engineering for the one placement it is still
+allowed in.
+
 ## 2026-10-03 — L1 hardening: warm upstream connections close the answer-path residual
 
 The 2026-10-01 pass equalised the *answer* time of the relay's two paths — a
