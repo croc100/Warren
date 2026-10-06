@@ -29,6 +29,7 @@ func main() {
 	genKey := flag.Bool("genkey", false, "generate a relay identity key pair, print it, and exit")
 	profileOnly := flag.Bool("profile-only", false, "measure the fallback site's TLS handshake shape, print it, and exit")
 	profileRefresh := flag.Duration("profile-refresh", 30*time.Minute, "how often to re-measure the fallback site (its certificate rotates)")
+	maxConns := flag.Int("max-conns", transport.DefaultMaxConns, "connections held at once; past it the relay stops accepting, like an overloaded server")
 	profileInsecure := flag.Bool("profile-insecure", false, "skip certificate verification while measuring the fallback site (local demos only)")
 	flag.Parse()
 
@@ -104,6 +105,7 @@ func main() {
 		FallbackSNI:      *fallbackSNI,
 		FallbackAddr:     *fallbackAddr,
 		FlightFunc:       current.Load,
+		MaxConns:         *maxConns,
 	}
 
 	go func() {
