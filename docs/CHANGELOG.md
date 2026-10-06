@@ -4,6 +4,39 @@ Newest first. This file records *why* things changed, since that is the part a d
 does not keep. Structural decisions live in [`DESIGN.md`](../DESIGN.md) §14 and in
 [`docs/adr/`](adr/).
 
+## 2026-10-07 — L1 hardening: a cap on connections held at once
+
+ROADMAP H7. `Serve` started a goroutine per accept with no bound, and every
+unauthenticated connection also opened one to the borrowed site, so a flood both
+exhausted the relay and was passed on to a site the relay does not own.
+
+`Config.MaxConns` (default 256; `-max-conns` on `cmd/node`) now caps how many
+connections the relay holds at once. A slot is taken before `Accept` and given
+back when the connection's handling ends, Warren session or splice. At the cap
+the relay simply stops accepting: new connections wait in the kernel's listen
+backlog and, once it fills, their SYNs go unanswered. That is what an overloaded
+server looks like, and it falls on every connection alike — which matters,
+because deciding whom to turn away would mean reading connections first and
+treating Warren clients differently from probes, the split H8 just removed.
+
+The backlog had planned to account for the site's footprint in the warm pool.
+It turned out not to need a second mechanism: only a held client connection or
+the pool itself ever opens a connection to the site, so capping client
+connections caps the footprint at `MaxConns + warmPoolSize`.
+
+What is left, and stated in the roadmap: there is no per-source limit (a
+per-address cap would be a distinguisher costing a few dozen connections);
+filling the cap is observable to anyone willing to hold `MaxConns` connections;
+and connect-close churn reaches the site at the attacker's own rate, a
+reflection rather than an amplification.
+
+`TestServeHoldsAtMostMaxConns` fills a cap of two, checks a third connection is
+not served, frees a slot and checks it then is. It was run against the cap
+removed and fails. Its first version would not have: the over-cap connection
+sent four bytes, too few for the sniff to rule out a ClientHello, so even an
+uncapped relay sat on it for the five-second sniff and the half-second check
+passed regardless. It now sends a plaintext request that is spliced at once.
+
 ## 2026-10-07 — L1 hardening: a relay whose borrowed site is down refuses everyone
 
 ROADMAP H8. When the borrowed site stopped answering, the splice's dial failed

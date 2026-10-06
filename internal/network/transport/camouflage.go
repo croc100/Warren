@@ -87,6 +87,11 @@ type Config struct {
 	// connection to the real site instead of serving a shape it cannot trust.
 	FlightFunc func() *FlightProfile
 
+	// MaxConns caps how many connections the relay holds at once, Warren
+	// sessions and spliced visits alike. Zero or negative means
+	// DefaultMaxConns. Relay side only; see Serve for what happens at the cap.
+	MaxConns int
+
 	// Fingerprint selects which browser ClientHello uTLS parrots. Zero value
 	// means DefaultFingerprint.
 	//
@@ -97,6 +102,19 @@ type Config struct {
 	// so the pinned profile has to keep moving. Per-region overrides matter too
 	// — the right parrot is whatever the local population actually runs.
 	Fingerprint utls.ClientHelloID
+}
+
+// DefaultMaxConns is the connection cap used when Config.MaxConns is unset. It
+// is sized for a residential relay: well above what its own clients and the
+// probes aimed at it need at once, and low enough that the goroutines, sockets
+// and upstream connections behind it stay small on a home machine.
+const DefaultMaxConns = 256
+
+func (c Config) maxConns() int {
+	if c.MaxConns > 0 {
+		return c.MaxConns
+	}
+	return DefaultMaxConns
 }
 
 // flight returns the profile this relay should imitate right now.
@@ -310,7 +328,9 @@ func Dial(ctx context.Context, addr string, cfg Config) (net.Conn, error) {
 const defaultFinishedRecordLen = 4 + 32 + 1 + 16
 
 // Handler processes an authenticated Warren connection. Implementations own
-// the lifetime of conn and must close it when done.
+// the lifetime of conn and must close it when done. The connection counts
+// against Config.MaxConns until the handler returns, so a handler that hands
+// conn to another goroutine and returns early takes it out of the cap.
 type Handler func(conn net.Conn)
 
 // Serve accepts connections on ln, validating each one's embedded tag. Valid
@@ -336,15 +356,39 @@ func Serve(ctx context.Context, ln net.Listener, cfg Config, handle Handler) err
 	pool := newWarmPool(cfg.FallbackAddr, warmPoolSize, warmConnTTL)
 	go pool.run(ctx)
 
+	// Cap the connections held at once (ROADMAP H7). Without it every accept was
+	// a goroutine, and every unauthenticated one also a connection to the
+	// borrowed site, with nothing bounding either: a flood exhausts the relay and
+	// is passed on to a site the relay does not own. With it, the relay holds at
+	// most maxConns client connections, so at most maxConns spliced upstreams plus
+	// the warm pool's warmPoolSize face the site.
+	//
+	// At the cap the relay stops calling Accept rather than accepting and
+	// closing. New connections then wait in the kernel's listen backlog and, once
+	// that fills, their SYNs go unanswered — what an overloaded server does, with
+	// no Warren-specific answer for a prober to fingerprint. It also falls on
+	// every connection alike: deciding which to turn away would mean reading
+	// them first, and treating Warren clients differently from probes is exactly
+	// the split H8 removed.
+	slots := make(chan struct{}, cfg.maxConns())
 	for {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return nil
+		}
 		raw, err := ln.Accept()
 		if err != nil {
+			<-slots
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
 		}
-		go serveConn(ctx, raw, cfg, replays, pool, handle)
+		go func() {
+			defer func() { <-slots }()
+			serveConn(ctx, raw, cfg, replays, pool, handle)
+		}()
 	}
 }
 
