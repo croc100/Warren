@@ -62,6 +62,13 @@ const (
 	// warmHealthProbe is how long the hand-out check waits for the connection to
 	// prove it is still idle (see connStillIdle).
 	warmHealthProbe = 2 * time.Millisecond
+
+	// siteDownAfter is how many consecutive failed dials to the borrowed site it
+	// takes before the relay treats the site as unreachable and refuses to serve
+	// (ROADMAP H8). More than one so a single dropped SYN does not take the relay
+	// down; few enough that, with background dials every warmRefillInterval, the
+	// relay stops answering within a few seconds of its site doing so.
+	siteDownAfter = 2
 )
 
 type warmConn struct {
@@ -79,6 +86,11 @@ type warmPool struct {
 
 	mu    sync.Mutex
 	conns []warmConn
+
+	// dialFailures counts consecutive failed dials to the site, from both the
+	// background filler and the splice's fresh dials; any success resets it.
+	// Guarded by mu.
+	dialFailures int
 }
 
 func newWarmPool(addr string, size int, ttl time.Duration) *warmPool {
@@ -152,6 +164,7 @@ func (p *warmPool) topUp(ctx context.Context) {
 		}
 
 		c, err := p.dialer.DialContext(ctx, "tcp", p.addr)
+		p.recordDial(ctx, err)
 		if err != nil {
 			return
 		}
@@ -166,6 +179,41 @@ func (p *warmPool) topUp(ctx context.Context) {
 			c.Close()
 		}
 	}
+}
+
+// recordDial feeds the outcome of one dial to the site into the reachability
+// verdict. A dial abandoned because the relay is shutting down says nothing
+// about the site and is not counted.
+func (p *warmPool) recordDial(ctx context.Context, err error) {
+	if p == nil || (err != nil && ctx.Err() != nil) {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err != nil {
+		p.dialFailures++
+	} else {
+		p.dialFailures = 0
+	}
+}
+
+// siteReachable reports whether the borrowed site is answering dials (ROADMAP
+// H8). It starts out true — nothing has failed yet — and turns false after
+// siteDownAfter consecutive failures. The background filler keeps dialing while
+// the site is down, so the first success afterwards turns it back on without
+// anything else having to notice. A pool with no address knows nothing about any
+// site and always reports true.
+//
+// This only sees a site that refuses or drops the connection. A site that
+// accepts the TCP connection and then rejects the relay at the TLS layer
+// (DESIGN §15) still looks reachable here.
+func (p *warmPool) siteReachable() bool {
+	if p == nil || p.addr == "" {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dialFailures < siteDownAfter
 }
 
 // pruneStale drops connections older than the TTL. The hand-out check in get
